@@ -3,7 +3,7 @@
 # github.com/trey-copeland/gotdms is required at the pseudo-version in go.mod.
 # There is no replace directive.
 
-name: ci
+name: 'Build and test Go bridge and Python package'
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: build-and-test-bridge-and-python-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

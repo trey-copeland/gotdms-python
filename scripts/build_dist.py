@@ -4,7 +4,7 @@
 The wheel build is hatchling plus hatch_build.py. This script only sets
 GOOS, GOARCH, CGO_ENABLED, and GOTDMS_PLAT_TAG, then runs `python -m build`.
 
-Platform tags used by the release workflow:
+Platform tags used by .github/workflows/build-and-publish-python-package.yml:
 
     linux/amd64   manylinux_2_17_x86_64
     linux/arm64   manylinux_2_17_aarch64
