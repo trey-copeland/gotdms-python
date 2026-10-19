@@ -182,28 +182,62 @@ class Session:
         gotdms has no DAQmx channel objects. A DAQmx raw channel is ordinary
         metadata with its stored data type, not a scaled DAQmx waveform.
         """
-        header = {"op": "open"}
-        if paths:
-            header["paths"] = [str(p) for p in paths]
-        if directory:
-            header["directory"] = str(directory)
-            header["pattern"] = pattern or "*.tdms"
-        if timestamp_channel is not None:
-            header["timestamp_channel"] = timestamp_channel
-        if timestamp_channels:
-            header["timestamp_channels"] = dict(timestamp_channels)
-        if numeric_epoch is not None:
-            header["numeric_epoch"] = _rfc3339(numeric_epoch)
-        if basis is not None:
-            header["basis"] = _rfc3339(basis)
-        if overlap is not None:
-            header["overlap"] = overlap
-        if workers:
-            header["workers"] = int(workers)
-        if read_workers:
-            header["read_workers"] = int(read_workers)
+        header = _dataset_header(
+            "open",
+            paths,
+            directory=directory,
+            pattern=pattern,
+            timestamp_channel=timestamp_channel,
+            timestamp_channels=timestamp_channels,
+            numeric_epoch=numeric_epoch,
+            basis=basis,
+            overlap=overlap,
+            workers=workers,
+            read_workers=read_workers,
+        )
         self._catalog = self._rpc(header)
         return self._catalog
+
+    def describe(
+        self,
+        paths=None,
+        *,
+        directory=None,
+        pattern="*.tdms",
+        timestamp_channel=None,
+        timestamp_channels=None,
+        numeric_epoch=None,
+        basis=None,
+        overlap=None,
+        workers=None,
+        read_workers=None,
+    ):
+        """Metadata for a file set. Does not decode channel samples.
+
+        ``open`` asks the dataset layer to read declared timestamp channels
+        so it can learn each file's span. ``describe`` does not. It reads
+        groups, channels, stored types, sample counts, scales, and waveform
+        properties. ``sample_reads`` in the result is the number of raw-data
+        reads, and it is 0. A numeric timestamp channel still requires
+        ``numeric_epoch``; that check uses the stored type.
+        """
+        header = _dataset_header(
+            "describe",
+            paths,
+            directory=directory,
+            pattern=pattern,
+            timestamp_channel=timestamp_channel,
+            timestamp_channels=timestamp_channels,
+            numeric_epoch=numeric_epoch,
+            basis=basis,
+            overlap=overlap,
+            workers=workers,
+            read_workers=read_workers,
+        )
+        described = self._rpc(header)
+        if described.get("sample_reads", 0) != 0:
+            raise ProtocolError("describe decoded channel sample data")
+        return described
 
     def catalog(self):
         """Return groups, channels, and properties. Does not decode samples."""
@@ -269,12 +303,20 @@ class Session:
         relative=True,
         scaled=False,
         basis=None,
+        offset=None,
+        limit=None,
     ):
         """Read several channels in one request.
 
         The bridge calls dataset ``ReadMany`` once, so channels that share a
         timestamp channel share one clock decode. Pass both ``start`` and
         ``end`` for a half-open window. Omit both for the full span.
+
+        ``offset`` and ``limit`` select a sample range of the merged series
+        instead of a time window. The bridge reads that range with
+        ``Channel.Slice`` and does not decode the other samples. Omit both
+        for the full series. A time window and a sample range together are
+        an error.
 
         ``scaled`` defaults to False. gotdms returns raw samples. Set it only
         when you want the NI linear scale applied (``raw * slope + intercept``).
@@ -283,6 +325,38 @@ class Session:
         :class:`NoScaleError`. A non-linear scale raises
         :class:`NonlinearScaleError` and is not applied. DAQmx scales are not
         applied.
+        """
+        series, _header = self.read_channels(
+            channels,
+            start=start,
+            end=end,
+            absolute=absolute,
+            relative=relative,
+            scaled=scaled,
+            basis=basis,
+            offset=offset,
+            limit=limit,
+        )
+        return series
+
+    def read_channels(
+        self,
+        channels,
+        *,
+        start=None,
+        end=None,
+        absolute=True,
+        relative=True,
+        scaled=False,
+        basis=None,
+        offset=None,
+        limit=None,
+    ):
+        """Like :meth:`read_many`, and also return the bridge header.
+
+        The header's ``reads`` list is the sample ranges the bridge decoded.
+        ``limited`` is true when ``offset`` or ``limit`` was applied. A bridge
+        that ignores a requested range raises :class:`ProtocolError`.
         """
         specs = []
         for item in channels:
@@ -307,8 +381,18 @@ class Session:
             header["end"] = _rfc3339(end)
         if basis is not None:
             header["basis"] = _rfc3339(basis)
+        if offset is not None:
+            header["offset"] = int(offset)
+        if limit is not None:
+            header["limit"] = int(limit)
         header_out, payload = self._rpc_raw(header)
-        return series_from_parts(header_out.get("channels", []), split_payload(payload))
+        if (offset is not None or limit is not None) and not header_out.get("limited"):
+            raise ProtocolError(
+                "gotdms-bridge ignored the sample range. Rebuild gotdms-bridge; "
+                "protocol 1 range reads are required."
+            )
+        series = series_from_parts(header_out.get("channels", []), split_payload(payload))
+        return series, header_out
 
     def read_all(self, **kwargs):
         """Eager read of every data channel, one ``read_many``.
@@ -553,6 +637,43 @@ def open(paths=None, *, binary=None, **kwargs) -> Session:
         session.close()
         raise
     return session
+
+
+def _dataset_header(
+    op,
+    paths=None,
+    *,
+    directory=None,
+    pattern="*.tdms",
+    timestamp_channel=None,
+    timestamp_channels=None,
+    numeric_epoch=None,
+    basis=None,
+    overlap=None,
+    workers=None,
+    read_workers=None,
+):
+    header = {"op": op}
+    if paths:
+        header["paths"] = [str(p) for p in paths]
+    if directory:
+        header["directory"] = str(directory)
+        header["pattern"] = pattern or "*.tdms"
+    if timestamp_channel is not None:
+        header["timestamp_channel"] = timestamp_channel
+    if timestamp_channels:
+        header["timestamp_channels"] = dict(timestamp_channels)
+    if numeric_epoch is not None:
+        header["numeric_epoch"] = _rfc3339(numeric_epoch)
+    if basis is not None:
+        header["basis"] = _rfc3339(basis)
+    if overlap is not None:
+        header["overlap"] = overlap
+    if workers:
+        header["workers"] = int(workers)
+    if read_workers:
+        header["read_workers"] = int(read_workers)
+    return header
 
 
 def _rfc3339(value) -> str:

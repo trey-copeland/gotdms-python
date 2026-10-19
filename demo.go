@@ -118,6 +118,77 @@ func writeC(path string) error {
 	return writeF64(dups, "d", []float64{1, 2, 3})
 }
 
+// WriteWaveformSet writes one file whose time axis is waveform properties.
+// A channel named Time is ordinary data. Nothing is inferred from that name.
+//
+//	w.tdms  group w  ai0 10..13 and ai1 1..4 share wf_start_time DemoEpoch
+//	        and wf_increment 1s. Time stores 100..103 and is not a clock.
+func WriteWaveformSet(dir string) (DemoSet, error) {
+	path := filepath.Join(dir, "w.tdms")
+	w, err := tdms.Create(path)
+	if err != nil {
+		return DemoSet{}, err
+	}
+	defer w.Close()
+	g := w.Group("w")
+	if err := writeWave(g, "ai0", DemoEpoch, 1, []float64{10, 11, 12, 13}); err != nil {
+		return DemoSet{}, err
+	}
+	if err := writeWave(g, "ai1", DemoEpoch, 1, []float64{1, 2, 3, 4}); err != nil {
+		return DemoSet{}, err
+	}
+	if err := writeF64(g, "Time", []float64{100, 101, 102, 103}); err != nil {
+		return DemoSet{}, err
+	}
+	return DemoSet{Dir: dir, Files: []string{path}, Epoch: DemoEpoch}, nil
+}
+
+// WriteGapSet writes two files with a hole between them.
+//
+//	ga.tdms  acq Time 0,1  ai0 10,11
+//	gb.tdms  acq Time 4,5  ai0 14,15
+//
+// The merged series is four samples. The instants 2s and 3s are a gap, not
+// null-filled rows.
+func WriteGapSet(dir string) (DemoSet, error) {
+	a := filepath.Join(dir, "ga.tdms")
+	b := filepath.Join(dir, "gb.tdms")
+	if err := writeStampFile(a, []float64{0, 1}, []float64{10, 11}); err != nil {
+		return DemoSet{}, err
+	}
+	if err := writeStampFile(b, []float64{4, 5}, []float64{14, 15}); err != nil {
+		return DemoSet{}, err
+	}
+	return DemoSet{Dir: dir, Files: []string{a, b}, Epoch: DemoEpoch}, nil
+}
+
+func writeStampFile(path string, times, values []float64) error {
+	w, err := tdms.Create(path)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	g := w.Group("acq")
+	if err := writeF64(g, "Time", times); err != nil {
+		return err
+	}
+	return writeF64(g, "ai0", values)
+}
+
+func writeWave(g *tdms.GroupWriter, name string, start time.Time, inc float64, vals []float64) error {
+	ch, err := g.Channel(name, tdms.TypeFloat64)
+	if err != nil {
+		return err
+	}
+	if err := ch.SetProperty(tdms.PropStartTime, start); err != nil {
+		return err
+	}
+	if err := ch.SetProperty(tdms.PropIncrement, inc); err != nil {
+		return err
+	}
+	return ch.Write(vals)
+}
+
 func writeF64(g *tdms.GroupWriter, name string, vals []float64) error {
 	ch, err := g.Channel(name, tdms.TypeFloat64)
 	if err != nil {

@@ -28,7 +28,7 @@ classifiers = [
 ]
 dependencies = [
   "numpy>=1.26",
-  "polars>=1.0",
+  "polars>=2",
   "pyarrow>=14",
 ]
 
