@@ -17,7 +17,16 @@ with gotdms.open(
     values = session["acq"]["ai0"].data()  # raw float64
     times = session["acq"]["ai0"].time_track(absolute_time=True)
     frame = session.as_polars(time="column", align="strict")
+
+lazy = gotdms.scan_tdms(
+    "run/*.tdms",
+    timestamp_channel="Time",
+    numeric_epoch="2024-03-01T00:00:00Z",
+)
+frame = lazy.select("time", "acq/ai0").head(1000).collect()
 ```
+
+`scan_tdms` returns a Polars `LazyFrame`. Calling it reads groups, channels, types, and sample counts. It does not decode channel samples. `select` then `head` or `limit`, with no filter, decodes only those channels and only that prefix (`Channel.Slice` on the bridge). A predicate runs in Python after the read. `slice(offset, length)` is not pushed on Polars 2: the selected columns are read in full and Polars slices the batch. The same timestamp rules as `open` apply, including a caller-supplied `basis` that a row limit does not move. See [`docs/nptdms-migration.md`](docs/nptdms-migration.md).
 
 Polars has no row index. npTDMS `as_dataframe(time_index=True)` is the `time` column (`Datetime(ns, UTC)`). `align="strict"` requires equal time vectors and inserts no nulls. `align="nptdms"` is a full outer join on that column and inserts nulls where npTDMS inserted NaNs. `scaled` defaults to false. npTDMS scales unless you opt out. Pass `scaled=True` only when an NI linear scale should be applied. A missing scale is an error. Non-linear scales and DAQmx are not applied.
 

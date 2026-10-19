@@ -38,14 +38,14 @@ Both modes return raw samples unless you set `scaled=True` or `--scaled`.
 | npTDMS | gotdms |
 | --- | --- |
 | `TdmsFile.read_metadata(path)` | `gotdms.open(...)` then `session.catalog()`, `find`, `search`. Data-channel samples are not decoded. Opening still reads declared timestamp channels so the dataset can learn each file's span. |
-| `TdmsFile.read(path)` | `gotdms.open(...)` then `session.read_all()` or `session.as_polars()`. |
+| `TdmsFile.read(path)` | `gotdms.open(...)` then `session.read_all()` or `session.as_polars()`. For a lazy frame, `gotdms.scan_tdms(...).collect()`. |
 | `tdms[group][channel]` | `session[group][channel]`. A bare `session.channel(name)` works only when the name is in one group. Two groups raise `AmbiguousChannelError`. |
 | `channel.properties` | `channel.properties`. Compared per file; `properties_match` is false when files disagree. |
 | `channel[:]` / `read_data(scaled=True)` | `channel.data()`. Raw. Pass `scaled=True` to apply an NI linear scale. |
 | `channel.raw_data` / `read_data(scaled=False)` | `channel.data()` with the default `scaled=False`. |
 | `channel.time_track(absolute_time=True)` | `channel.time_track(absolute_time=True)`, `numpy.datetime64[ns]`. |
 | `channel.time_track(absolute_time=False)` | `channel.time_track(absolute_time=False)` is seconds since the basis, not npTDMS's zero-at-first-sample track. See below. |
-| `as_dataframe(time_index=True, absolute_time=..., scaled_data=True)` | `as_polars(time="column", absolute_time=..., align="nptdms", scaled=True)`. Polars has no row index, so the DatetimeIndex is a `time` column. Default `align` is `"strict"` and default `scaled` is `False`. |
+| `as_dataframe(time_index=True, absolute_time=..., scaled_data=True)` | `as_polars(time="column", absolute_time=..., align="nptdms", scaled=True)`, or `scan_tdms(..., absolute_time=..., align="nptdms", scaled=True).collect()`. Polars has no row index, so the DatetimeIndex is a `time` column. Default `align` is `"strict"` and default `scaled` is `False`. |
 | `tdmsinfo` | No CLI inspector. Use `catalog` or the convert manifest. |
 | HDF5 export | Not provided. |
 
@@ -97,6 +97,24 @@ with gotdms.open(
     )
 ```
 
+Lazy scan, in the spirit of `polars.scan_parquet`. The `LazyFrame` is built from catalog metadata. Samples are decoded at `collect`:
+
+```python
+import gotdms
+
+frame = gotdms.scan_tdms(
+    "run/*.tdms",
+    timestamp_channel="Time",
+    numeric_epoch="2024-03-01T00:00:00Z",
+).select("time", "acq/ai0").head(1000).collect()
+```
+
+`source` is one file, a list of files, a directory (with `pattern`, default `*.tdms`), or a non-recursive glob. `**` is an error. Columns are `group/name`, matched across files the same way as a dataset. Ambiguous group/name time axes are an error. A gap is reported on the read and is not a null row under `align="strict"`. An absolute-time collect that includes an untimed channel raises `UntimedError`, the same as `as_polars`. Timed channels that do not share a time vector raise `AlignmentError` under `align="strict"`.
+
+On Polars 2, `select` without a predicate pushes projection: the bridge decodes the selected data channels and the timestamp channel those columns use, not the rest of the file. `head(n)` and `limit(n)` without a predicate push `n` as a sample limit (offset 0) and the bridge reads that prefix with `Channel.Slice`. `filter` is applied in Python after the TDMS read. A filter written before `select` of a different column does not push projection, because the predicate still needs the other columns. `head` after `filter` is not pushed: Polars 2 does not pass `n_rows` with a predicate. `slice(offset, length)` is not pushed either (`n_rows` is `None`); the selected columns are read in full and Polars slices the batch. Direct `read` and `read_many` callers can still pass `offset`.
+
+`basis` is applied to the whole series. `head` does not re-zero relative time to the first returned sample.
+
 Catalog, the `read_metadata` equivalent:
 
 ```python
@@ -141,7 +159,7 @@ Declare the timestamp channel. `timestamp_channel="Time"` applies to every group
 
 If a group has no declaration, waveform `wf_start_time` and `wf_increment` are the fallback. Nothing else is inferred.
 
-`basis` is the origin for relative time. Relative time is `sample_time - basis` in seconds, negative before the basis. The default basis, when you omit it, is the earliest timed sample in the catalog, chosen once at open. A window does not move it, so the first returned sample is not re-zeroed.
+`basis` is the origin for relative time. Relative time is `sample_time - basis` in seconds, negative before the basis. The default basis, when you omit it, is the earliest timed sample in the catalog, chosen once at open (and once per `scan_tdms` collect, which opens the dataset then). A window does not move it, and neither does `head` or `limit`, so the first returned sample is not re-zeroed.
 
 npTDMS `time_track(absolute_time=False)` needs `wf_increment` and `wf_start_offset` and returns `offset + i * increment`. With the usual zero offset, the first sample is 0. `absolute_time=True` additionally needs `wf_start_time`. gotdms does not require those properties when a timestamp channel was declared, and `absolute_time=False` is not that npTDMS array.
 
@@ -209,7 +227,9 @@ Each `.arrow` file is one Arrow IPC stream with one record batch. The schema met
 
 A data payload is `uint32` count, then for each channel `uint32` byte length and one Arrow IPC stream. The header's `channels` array is in the same order. Empty payloads are metadata replies. Errors are `{"op":"error","code":"...","message":"..."}` and the Python client raises the matching exception. A version other than 1 returns `bad_version` and the process keeps reading.
 
-Requests: `open`, `catalog`, `find`, `search`, `match`, `read`, `read_many`, `close`. `open` takes `paths` or `directory` plus `pattern`, `timestamp_channel`, `timestamp_channels`, `numeric_epoch`, `basis`, `overlap` (`keep_first`, `keep_last`, `error`), `workers`, and `read_workers`. Reads take `absolute` (default true), `relative` (default true), `scaled` (default false), optional `basis`, and optional `start` and `end`.
+Requests: `open`, `describe`, `catalog`, `find`, `search`, `match`, `read`, `read_many`, `close`. `open` and `describe` take `paths` or `directory` plus `pattern`, `timestamp_channel`, `timestamp_channels`, `numeric_epoch`, `basis`, `overlap` (`keep_first`, `keep_last`, `error`), `workers`, and `read_workers`. `describe` returns `sample_reads` (0), `files`, `groups`, and `channels`. It does not call `dataset.Open` and does not decode samples. Reads take `absolute` (default true), `relative` (default true), `scaled` (default false), optional `basis`, optional `start` and `end`, and optional `offset` and `limit`.
+
+`offset` and `limit` select a half-open sample range of the merged series, `[offset, offset+limit)`. Omit both for the full dataset read, which is unchanged. `limit` without `offset` is a prefix. `offset` without `limit` reads through the end. A time window together with a sample range is an error. The response adds `reads` and `limited`. `reads` lists each decoded slice: `file`, `group`, `name`, `role` (`data` or `timestamp`), `offset`, `length`, and `channel_samples`. `limited` is true when a sample range was applied. Clients that do not know these fields ignore them. A Python read that asked for a range and got `limited: false` raises `ProtocolError`, which is how an older bridge that ignored the fields is detected. Protocol version stays 1.
 
 ## Gaps that remain
 
@@ -218,7 +238,7 @@ Requests: `open`, `catalog`, `find`, `search`, `match`, `read`, `read_many`, `cl
 - No HDF5 export.
 - No `tdmsinfo` CLI.
 - Memory mapping is intentionally absent.
-- `Channel.Slice` and `CursorAt` read a sample range without walking earlier samples. Dataset waveform windows do not call them. The cursor starts at sample 0, batches before the window are discarded, and the walk stops at the window, so a tail window still decodes the prefix. A declared timestamp axis is decoded in full on read because the times are the samples. Catalog of a uniform clock reads the first two samples and derives the span; a first step that is not positive is scanned in full. This bridge calls dataset and does not add its own range read.
+- `Channel.Slice` and `CursorAt` read a sample range without walking earlier samples. Dataset time windows do not use them: a waveform window still starts its cursor at sample 0, and a timestamp axis is decoded in full. `offset` and `limit` on `read` and `read_many` are a bridge range read. They call `Slice` for the merged sample range and do not decode the other samples of the selected channels. A full read, and any `start`/`end` window, still goes through dataset. `describe` does not read samples. `open` still learns each file's span from declared clocks (first two samples when the first step is positive, otherwise the whole clock). That catalog read is not listed in `reads`. A `head` or `limit` on `scan_tdms` does not move `basis`.
 - Eager `read_all` is an explicit call. `open` alone does not pull every sample into Python.
 - File-status for an incomplete final segment is the core reader's behavior; the bridge does not add an npTDMS `file_status` object.
 - Integers wider than the float64 mantissa are returned as `float64`, which is what the dataset layer already does.

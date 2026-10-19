@@ -58,10 +58,13 @@ func Serve(r io.Reader, w io.Writer) error {
 }
 
 type session struct {
-	ds     *dataset.Dataset
-	meta   map[chKey]scaleInfo
-	files  []fileMeta
-	groups []groupMeta
+	ds       *dataset.Dataset
+	meta     map[chKey]scaleInfo
+	files    []fileMeta
+	groups   []groupMeta
+	epoch    time.Time
+	epochSet bool
+	overlap  dataset.OverlapPolicy
 }
 
 func (s *session) dispatch(op string, req map[string]json.RawMessage) (any, []byte, error) {
@@ -89,13 +92,11 @@ func (s *session) dispatch(op string, req map[string]json.RawMessage) (any, []by
 			return nil, nil, err
 		}
 		return map[string]any{"op": "result", "channels": s.filterName(hits)}, nil, nil
+	case "describe":
+		return s.describe(req)
 	case "read":
 		sel := dataset.Selector{Name: jsonString(req, "name"), Group: jsonString(req, "group")}
-		tables, err := s.readMany([]dataset.Selector{sel}, req)
-		if err != nil {
-			return nil, nil, err
-		}
-		return packTables(tables)
+		return s.finishRead([]dataset.Selector{sel}, req)
 	case "read_many":
 		var specs []struct {
 			Name  string `json:"name"`
@@ -110,11 +111,7 @@ func (s *session) dispatch(op string, req map[string]json.RawMessage) (any, []by
 		for i, sp := range specs {
 			sels[i] = dataset.Selector{Name: sp.Name, Group: sp.Group}
 		}
-		tables, err := s.readMany(sels, req)
-		if err != nil {
-			return nil, nil, err
-		}
-		return packTables(tables)
+		return s.finishRead(sels, req)
 	default:
 		return nil, nil, errCode("argument", "unknown op "+op)
 	}
@@ -131,6 +128,9 @@ func (s *session) open(req map[string]json.RawMessage) (any, []byte, error) {
 	if s.ds != nil {
 		return nil, nil, errCode("argument", "dataset already open")
 	}
+	s.epoch = time.Time{}
+	s.epochSet = false
+	s.overlap = dataset.OverlapKeepFirst
 	var paths []string
 	if raw, ok := req["paths"]; ok {
 		if err := json.Unmarshal(raw, &paths); err != nil {
@@ -163,6 +163,8 @@ func (s *session) open(req map[string]json.RawMessage) (any, []byte, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		s.epoch = t
+		s.epochSet = true
 		opts = append(opts, dataset.WithNumericEpoch(t))
 	}
 	if raw, ok := req["basis"]; ok && string(raw) != "null" {
@@ -175,10 +177,13 @@ func (s *session) open(req map[string]json.RawMessage) (any, []byte, error) {
 	if p, ok := jsonStringOK(req, "overlap"); ok {
 		switch p {
 		case "keep_first", "":
+			s.overlap = dataset.OverlapKeepFirst
 			opts = append(opts, dataset.WithOverlap(dataset.OverlapKeepFirst))
 		case "keep_last":
+			s.overlap = dataset.OverlapKeepLast
 			opts = append(opts, dataset.WithOverlap(dataset.OverlapKeepLast))
 		case "error":
+			s.overlap = dataset.OverlapError
 			opts = append(opts, dataset.WithOverlap(dataset.OverlapError))
 		default:
 			return nil, nil, errCode("argument", "overlap "+p)
@@ -282,42 +287,89 @@ func (s *session) enrich(in []dataset.Occurrence) []channelJSON {
 }
 
 func (s *session) readMany(sels []dataset.Selector, req map[string]json.RawMessage) ([]table, error) {
+	tables, _, _, err := s.readTables(sels, req)
+	return tables, err
+}
+
+// finishRead packs channel tables and attaches the sample-range log.
+// reads lists channel slices this call decoded. limited is false for a
+// dataset read of the whole span. Old clients ignore both fields.
+func (s *session) finishRead(sels []dataset.Selector, req map[string]json.RawMessage) (any, []byte, error) {
+	tables, reads, limited, err := s.readTables(sels, req)
+	if err != nil {
+		return nil, nil, err
+	}
+	header, payload, err := packTables(tables)
+	if err != nil {
+		return nil, nil, err
+	}
+	h, ok := header.(map[string]any)
+	if !ok {
+		return nil, nil, errCode("error", "internal header type")
+	}
+	if reads == nil {
+		reads = []spanRead{}
+	}
+	h["reads"] = reads
+	h["limited"] = limited
+	return h, payload, nil
+}
+
+func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMessage) ([]table, []spanRead, bool, error) {
 	if err := s.need(); err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
 	if len(sels) == 0 {
-		return nil, errCode("argument", "no channels")
+		return nil, nil, false, errCode("argument", "no channels")
 	}
 	cols := columnSet{absolute: jsonBool(req, "absolute", true), relative: jsonBool(req, "relative", true)}
 	scaled := jsonBool(req, "scaled", false)
+	basis := s.ds.Basis()
 	var ro []dataset.ReadOption
 	if raw, ok := req["basis"]; ok && string(raw) != "null" {
 		t, err := parseTime(raw)
 		if err != nil {
-			return nil, err
+			return nil, nil, false, err
 		}
+		basis = t
 		ro = append(ro, dataset.WithReadBasis(t))
 	}
 	start, end, window, err := windowOf(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
-	series, err := s.loadSeries(sels, start, end, window, ro)
+	offset, limit, limited, err := sampleBound(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
+	}
+	if limited && window {
+		return nil, nil, false, errCode("argument", "sample limit and time window are mutually exclusive")
+	}
+	var series []dataset.Series
+	var reads []spanRead
+	if limited {
+		series, reads, err = s.readLimited(sels, offset, limit, basis)
+	} else {
+		series, err = s.loadSeries(sels, start, end, window, ro)
+		if err == nil {
+			reads = s.fullReads(sels)
+		}
+	}
+	if err != nil {
+		return nil, nil, limited, err
 	}
 	tables := make([]table, len(series))
 	for i, ser := range series {
 		info, match, err := s.scaleFor(ser, scaled)
 		if err != nil {
-			return nil, err
+			return nil, nil, limited, err
 		}
 		tables[i], err = encodeSeries(ser, cols, info, scaled && info.hasLinear, match)
 		if err != nil {
-			return nil, err
+			return nil, nil, limited, err
 		}
 	}
-	return tables, nil
+	return tables, reads, limited, nil
 }
 
 func (s *session) loadSeries(sels []dataset.Selector, start, end time.Time, window bool, ro []dataset.ReadOption) ([]dataset.Series, error) {

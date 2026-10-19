@@ -65,6 +65,7 @@ func runDemo(args []string) error {
 	fs := flag.NewFlagSet("demo", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	out := fs.String("out", "", "directory to write")
+	kind := fs.String("set", "demo", "demo, waveform, or gap")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -74,7 +75,18 @@ func runDemo(args []string) error {
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}
-	set, err := bridge.WriteDemoSet(*out)
+	var set bridge.DemoSet
+	var err error
+	switch *kind {
+	case "demo":
+		set, err = bridge.WriteDemoSet(*out)
+	case "waveform":
+		set, err = bridge.WriteWaveformSet(*out)
+	case "gap":
+		set, err = bridge.WriteGapSet(*out)
+	default:
+		return fmt.Errorf("unknown demo set %q", *kind)
+	}
 	if err != nil {
 		return err
 	}
@@ -82,7 +94,8 @@ func runDemo(args []string) error {
 		Epoch string   `json:"epoch"`
 		Dir   string   `json:"dir"`
 		Files []string `json:"files"`
-	}{Epoch: set.Epoch.Format(time.RFC3339Nano), Dir: set.Dir, Files: set.Files}
+		Set   string   `json:"set"`
+	}{Epoch: set.Epoch.Format(time.RFC3339Nano), Dir: set.Dir, Files: set.Files, Set: *kind}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(doc)

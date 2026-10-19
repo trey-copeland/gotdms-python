@@ -316,14 +316,17 @@ func (c *client) close() {
 }
 
 type reply struct {
-	Op         string
-	Code       string
-	Message    string
-	Channels   []channelJSON
-	Read       []channelOut
-	Candidates []channelJSON
-	Payload    []byte
-	Closed     bool
+	Op          string
+	Code        string
+	Message     string
+	Channels    []channelJSON
+	Read        []channelOut
+	Candidates  []channelJSON
+	Reads       []spanRead
+	Limited     bool
+	SampleReads int
+	Payload     []byte
+	Closed      bool
 }
 
 func (c *client) call(t *testing.T, header map[string]any) reply {
@@ -345,12 +348,15 @@ func (c *client) callVersion(t *testing.T, version uint16, header map[string]any
 		t.Fatal(err)
 	}
 	var raw struct {
-		Op         string          `json:"op"`
-		Code       string          `json:"code"`
-		Message    string          `json:"message"`
-		Channels   json.RawMessage `json:"channels"`
-		Candidates []channelJSON   `json:"candidates"`
-		Closed     bool            `json:"closed"`
+		Op          string          `json:"op"`
+		Code        string          `json:"code"`
+		Message     string          `json:"message"`
+		Channels    json.RawMessage `json:"channels"`
+		Candidates  []channelJSON   `json:"candidates"`
+		Reads       []spanRead      `json:"reads"`
+		Limited     bool            `json:"limited"`
+		SampleReads int             `json:"sample_reads"`
+		Closed      bool            `json:"closed"`
 	}
 	if err := json.Unmarshal(f.Header, &raw); err != nil {
 		t.Fatal(err)
@@ -358,6 +364,7 @@ func (c *client) callVersion(t *testing.T, version uint16, header map[string]any
 	r := reply{
 		Op: raw.Op, Code: raw.Code, Message: raw.Message,
 		Candidates: raw.Candidates, Payload: f.Payload, Closed: raw.Closed,
+		Reads: raw.Reads, Limited: raw.Limited, SampleReads: raw.SampleReads,
 	}
 	if len(raw.Channels) > 0 && string(raw.Channels) != "null" {
 		if len(f.Payload) > 0 {

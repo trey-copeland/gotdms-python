@@ -33,4 +33,4 @@ Recorded from the distributions installed in the packaging environment. Classifi
 | polars-runtime-32 | 2.0.0 | (pulled by polars) | Classifier `License :: OSI Approved :: MIT License`. This is the Rust runtime wheel Polars depends on. It is not copied into the gotdms wheel. |
 | pyarrow | 18.1.0 | >=3.9 | Apache-2.0. Metadata `License` is `Apache Software License`. |
 
-This package depends on `numpy>=1.26`, `polars>=1.0`, and `pyarrow>=14`, and sets `requires-python` to `>=3.10` because Polars 2.0 does. Polars' pandas extra is not used.
+This package depends on `numpy>=1.26`, `polars>=2`, and `pyarrow>=14`, and sets `requires-python` to `>=3.10` because Polars 2.0 does. `scan_tdms` uses `polars.io.plugins.register_io_source` from that release. Polars' pandas extra is not used.

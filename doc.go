@@ -11,4 +11,9 @@
 // frames. gotdms returns raw samples. A linear scale is
 // applied only when the request sets scaled, and only when every contributing
 // file has the same NI linear scale.
+//
+// describe returns the same catalog fields as open and does not decode
+// channel samples. read and read_many accept an optional sample offset and
+// limit. The response adds reads (the slices that were decoded) and limited.
+// Omitting both fields keeps the full dataset read. Protocol version stays 1.
 package bridge

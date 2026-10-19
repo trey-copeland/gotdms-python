@@ -18,6 +18,7 @@ license note, and the batch and interactive modes.
 from .bundle import Bundle, load_bundle
 from .client import Channel, Group, Session, bundled_binary, locate_binary, open
 from .codec import Series, as_polars
+from .scan import scan_tdms
 from .errors import (
     AlignmentError,
     AmbiguousChannelError,
@@ -58,4 +59,5 @@ __all__ = [
     "load_bundle",
     "locate_binary",
     "open",
+    "scan_tdms",
 ]
