@@ -1,5 +1,8 @@
-# Tag-gated release workflow for gotdms-python. No tag exists, and PyPI
-# trusted publishing is not configured, so this workflow does not run.
+# Tag-gated PyPI publish workflow for gotdms-python:
+# .github/workflows/build-and-publish-python-package.yml
+# No tag exists, and PyPI trusted publishing is not configured, so this
+# workflow does not run. When a trusted publisher is added, point it at
+# this file.
 #
 # It runs only on a v* tag. The publish job uses PyPI trusted publishing
 # (OIDC, id-token: write) and the GitHub environment named pypi. Until that
@@ -8,7 +11,7 @@
 # The Go build uses the gotdms version required in go.mod. It does not
 # check out gotdms or add a replace directive.
 
-name: release
+name: 'Build and publish Python package to PyPI'
 
 env:
   GOTOOLCHAIN: local

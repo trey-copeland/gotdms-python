@@ -3,7 +3,7 @@
 # the Go build downloads that module. This workflow does not check out
 # gotdms or add a replace directive.
 
-name: wheels
+name: 'Build and verify Python packages'
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: wheels-${{ github.workflow }}-${{ github.ref }}
+  group: build-and-verify-python-packages-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

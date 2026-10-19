@@ -9,7 +9,7 @@ This repository is the Python client and the `gotdms-bridge` binary. It was extr
 - Import package: `gotdms`
 - Go module: `github.com/trey-copeland/gotdms-python`
 
-Nothing has been tagged in this repository. `pyproject.toml` records version `0.1.0` for the first release. That is not a git tag. Do not tag, and do not publish to PyPI, until a trusted publisher is a deliberate follow-up. `.github/workflows/release.yml` is present and tag-gated. Trusted publishing is not configured, so that workflow has nothing to run.
+Nothing has been tagged in this repository. `pyproject.toml` records version `0.1.0` for the first release. That is not a git tag. Do not tag, and do not publish to PyPI, until a trusted publisher is a deliberate follow-up. `.github/workflows/build-and-publish-python-package.yml` is that future publisher workflow. It is tag-gated. Trusted publishing is not configured, so it has nothing to run. Point the PyPI trusted publisher at that file when it is set up.
 
 ## Core module pin
 
@@ -44,7 +44,7 @@ This repository does not do that.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on push to `main` and on pull requests. Ubuntu tests Go 1.22 and 1.27 (`gofmt`, `go vet`, `go build ./...`, `go test ./...`). Go 1.22 also runs `go test -race ./...` and `python -m unittest discover -s python/tests`. Windows runs `go build ./...` and `go test ./...` on Go 1.22. `.github/workflows/wheels.yml` builds an sdist and a linux/amd64 wheel on the same events.
+`.github/workflows/build-and-test-bridge-and-python.yml` runs on push to `main` and on pull requests. Ubuntu tests Go 1.22 and 1.27 (`gofmt`, `go vet`, `go build ./...`, `go test ./...`). Go 1.22 also runs `go test -race ./...` and `python -m unittest discover -s python/tests`. Windows runs `go build ./...` and `go test ./...` on Go 1.22. `.github/workflows/build-and-verify-python-packages.yml` builds an sdist and a linux/amd64 wheel on the same events.
 
 ## Versions
 

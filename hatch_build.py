@@ -5,7 +5,7 @@ The tag is not inferred from a C extension, because the binary is package
 data. Cross-compiles set GOTDMS_PLAT_TAG (for example manylinux_2_17_x86_64)
 plus GOOS and GOARCH. A source install with those unset tags the wheel for
 the host (linux/amd64 -> manylinux_2_17_x86_64, and the four other pairs
-the release workflow builds). CGO_ENABLED=0.
+.github/workflows/build-and-publish-python-package.yml builds). CGO_ENABLED=0.
 
 go.mod requires github.com/trey-copeland/gotdms at a commit pseudo-version
 (v0.1.0 once that core tag exists). ``go build`` downloads that module.
