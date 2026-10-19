@@ -1,0 +1,8 @@
+dist/
+*.egg-info/
+.packaging/
+python/src/gotdms/_bin/
+__pycache__/
+*.pyc
+*.whl
+*.tar.gz

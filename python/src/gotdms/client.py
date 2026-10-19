@@ -1,0 +1,575 @@
+"""Long-lived client for the gotdms-bridge ``serve`` process.
+
+One process, one open dataset, many reads. Each request is one frame and
+each response is one frame, so a shared timestamp clock is decoded in the
+dataset layer and returned once. This module does not import npTDMS.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .codec import as_polars, series_from_parts, split_payload, write_frame, read_frame
+from .errors import (
+    AmbiguousChannelError,
+    ArgumentError,
+    GotdmsError,
+    MonotonicError,
+    NoFilesError,
+    NoScaleError,
+    NonlinearScaleError,
+    NotFoundError,
+    OverlapError,
+    ProtocolError,
+    ScaleMismatchError,
+    UntimedError,
+)
+
+_CODE_TYPES = {
+    "argument": ArgumentError,
+    "untimed": UntimedError,
+    "not_found": NotFoundError,
+    "no_files": NoFilesError,
+    "no_scale": NoScaleError,
+    "nonlinear_scale": NonlinearScaleError,
+    "scale_mismatch": ScaleMismatchError,
+    "overlap": OverlapError,
+    "monotonic": MonotonicError,
+    "bad_version": ProtocolError,
+    "protocol": ProtocolError,
+    "session_closed": GotdmsError,
+    "error": GotdmsError,
+}
+
+
+def bundled_binary() -> str | None:
+    """Path of the binary shipped in this wheel, if this install has one."""
+    name = "gotdms-bridge.exe" if os.name == "nt" else "gotdms-bridge"
+    path = Path(__file__).resolve().parent / "_bin" / name
+    if path.is_file():
+        return str(path)
+    return None
+
+
+def locate_binary(explicit=None) -> str:
+    """Find gotdms-bridge.
+
+    An explicit ``binary=`` argument wins, then the ``GOTDMS_BRIDGE``
+    environment variable, then the binary bundled in the wheel. A wheel
+    install therefore uses the bundled binary unless the caller overrides
+    it. There is no PATH search. If none of the three exist, this raises
+    with install instructions.
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("GOTDMS_BRIDGE")
+    if env:
+        return env
+    bundled = bundled_binary()
+    if bundled:
+        return bundled
+    raise GotdmsError(
+        "gotdms-bridge was not found. Install a platform wheel so the binary "
+        "is bundled (`pip install gotdms`), or set GOTDMS_BRIDGE to a binary "
+        "from `go build -o gotdms-bridge ./cmd/gotdms-bridge` in the "
+        "gotdms-python source tree (Go required). Protocol version 1."
+    )
+
+
+class Session:
+    """A dataset held open in one gotdms-bridge process.
+
+    ``TdmsFile.read_metadata`` maps to :meth:`open` and :meth:`catalog`.
+    Those calls do not decode data-channel samples. Opening still asks the
+    dataset layer to read declared timestamp channels so it can learn each
+    file's span. ``TdmsFile.read`` maps to :meth:`open` plus :meth:`read_all` or
+    :meth:`as_polars`.
+
+    The binary is not safe to share across threads. This class locks the
+    pipe so one session is still safe to call from several threads.
+    """
+
+    def __init__(self, binary=None):
+        binary = locate_binary(binary)
+        self.binary = binary
+        self._proc = subprocess.Popen(
+            [binary, "serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self._lock = threading.Lock()
+        self._stderr = bytearray()
+        self._drain = threading.Thread(target=self._read_stderr, name="gotdms-bridge-stderr", daemon=True)
+        self._drain.start()
+        self._catalog = None
+        self._closed = False
+
+    def _read_stderr(self):
+        stream = self._proc.stderr
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    return
+                self._stderr += chunk
+        except Exception:
+            return
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def close(self):
+        """Ask the bridge to close, then stop the process."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                if self._proc.poll() is None and self._proc.stdin is not None:
+                    write_frame(self._proc.stdin, {"op": "close"})
+                    read_frame(self._proc.stdout)
+            except Exception:
+                pass
+            finally:
+                for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+                    if stream is None:
+                        continue
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=5)
+
+    def open(
+        self,
+        paths=None,
+        *,
+        directory=None,
+        pattern="*.tdms",
+        timestamp_channel=None,
+        timestamp_channels=None,
+        numeric_epoch=None,
+        basis=None,
+        overlap=None,
+        workers=None,
+        read_workers=None,
+    ):
+        """Open a file set and return the catalog.
+
+        ``paths`` is an explicit list. ``directory`` plus ``pattern`` is a
+        glob. Declare timestamp channels the way the dataset package does:
+        ``timestamp_channel`` is the global name, and ``timestamp_channels``
+        maps a group to a name. An empty string opts that group out. Numeric
+        clocks need ``numeric_epoch``; there is no default epoch. ``basis``
+        is the relative-time origin. It is not moved to the first sample.
+
+        gotdms has no DAQmx channel objects. A DAQmx raw channel is ordinary
+        metadata with its stored data type, not a scaled DAQmx waveform.
+        """
+        header = {"op": "open"}
+        if paths:
+            header["paths"] = [str(p) for p in paths]
+        if directory:
+            header["directory"] = str(directory)
+            header["pattern"] = pattern or "*.tdms"
+        if timestamp_channel is not None:
+            header["timestamp_channel"] = timestamp_channel
+        if timestamp_channels:
+            header["timestamp_channels"] = dict(timestamp_channels)
+        if numeric_epoch is not None:
+            header["numeric_epoch"] = _rfc3339(numeric_epoch)
+        if basis is not None:
+            header["basis"] = _rfc3339(basis)
+        if overlap is not None:
+            header["overlap"] = overlap
+        if workers:
+            header["workers"] = int(workers)
+        if read_workers:
+            header["read_workers"] = int(read_workers)
+        self._catalog = self._rpc(header)
+        return self._catalog
+
+    def catalog(self):
+        """Return groups, channels, and properties. Does not decode samples."""
+        self._catalog = self._rpc({"op": "catalog"})
+        return self._catalog
+
+    def find(self, name: str):
+        return self._rpc({"op": "find", "name": name}).get("channels", [])
+
+    def search(self, text: str):
+        return self._rpc({"op": "search", "text": text}).get("channels", [])
+
+    def match(self, pattern: str):
+        return self._rpc({"op": "match", "pattern": pattern}).get("channels", [])
+
+    def groups(self):
+        """Groups in catalog order. This is the ``TdmsFile.groups`` shape."""
+        seen = []
+        for item in self._occurrences():
+            if item["group"] not in seen:
+                seen.append(item["group"])
+        return [Group(self, name) for name in seen]
+
+    def group(self, name: str) -> Group:
+        if not any(item["group"] == name for item in self._occurrences()):
+            raise NotFoundError(f"group {name!r} not found")
+        return Group(self, name)
+
+    def __getitem__(self, name: str) -> Group:
+        return self.group(name)
+
+    def channel(self, name: str, group: str | None = None) -> Channel:
+        """Look up one channel. A bare name that occurs in two groups raises.
+
+        npTDMS always indexes ``file[group][channel]``. gotdms allows a bare
+        name when it is unique across groups.
+        """
+        hits = [
+            item
+            for item in self._occurrences()
+            if item["name"] == name and (group is None or item["group"] == group)
+        ]
+        if not hits:
+            raise NotFoundError(f"channel {name!r} not found")
+        groups = {item["group"] for item in hits}
+        if group is None and len(groups) > 1:
+            raise AmbiguousChannelError(f"ambiguous channel {name!r}", hits)
+        return Channel(self, name, hits[0]["group"], hits)
+
+    def read(self, name: str, group: str | None = None, **kwargs):
+        """Read one channel. See :meth:`read_many` for the time and scale options."""
+        if group is None:
+            group = self.channel(name).group
+        return self.read_many([{"name": name, "group": group}], **kwargs)[0]
+
+    def read_many(
+        self,
+        channels,
+        *,
+        start=None,
+        end=None,
+        absolute=True,
+        relative=True,
+        scaled=False,
+        basis=None,
+    ):
+        """Read several channels in one request.
+
+        The bridge calls dataset ``ReadMany`` once, so channels that share a
+        timestamp channel share one clock decode. Pass both ``start`` and
+        ``end`` for a half-open window. Omit both for the full span.
+
+        ``scaled`` defaults to False. gotdms returns raw samples. Set it only
+        when you want the NI linear scale applied (``raw * slope + intercept``).
+        There is no silent scale. npTDMS returns scaled data unless you pass
+        ``scaled=False`` or read ``raw_data``. A missing linear scale raises
+        :class:`NoScaleError`. A non-linear scale raises
+        :class:`NonlinearScaleError` and is not applied. DAQmx scales are not
+        applied.
+        """
+        specs = []
+        for item in channels:
+            if isinstance(item, Channel):
+                specs.append({"name": item.name, "group": item.group})
+            elif isinstance(item, str):
+                ch = self.channel(item)
+                specs.append({"name": ch.name, "group": ch.group})
+            else:
+                specs.append({"name": item["name"], "group": item.get("group", "")})
+        header = {
+            "op": "read_many",
+            "channels": specs,
+            "absolute": bool(absolute),
+            "relative": bool(relative),
+            "scaled": bool(scaled),
+        }
+        if (start is None) ^ (end is None):
+            raise ArgumentError("window needs both start and end")
+        if start is not None:
+            header["start"] = _rfc3339(start)
+            header["end"] = _rfc3339(end)
+        if basis is not None:
+            header["basis"] = _rfc3339(basis)
+        header_out, payload = self._rpc_raw(header)
+        return series_from_parts(header_out.get("channels", []), split_payload(payload))
+
+    def read_all(self, **kwargs):
+        """Eager read of every data channel, one ``read_many``.
+
+        Declared timestamp channels are omitted because they are the clock.
+        Read one by name when you want its stored values. This is the
+        ``TdmsFile.read`` data step after :meth:`open`.
+        """
+        return self.read_many(self._data_channels(), **kwargs)
+
+    def as_polars(
+        self,
+        channels=None,
+        group: str | None = None,
+        *,
+        time="column",
+        absolute_time=True,
+        align="strict",
+        scaled=False,
+        start=None,
+        end=None,
+        basis=None,
+    ):
+        """Polars frame for a channel list, one group, or the whole set.
+
+        Polars has no row index. npTDMS ``time_index=True`` (a DatetimeIndex)
+        is the ``time`` column produced by ``time="column"``. See
+        :func:`gotdms.codec.as_polars` for the strict and full-join alignment.
+        ``scaled`` is forwarded to the read and defaults to False, unlike
+        npTDMS ``as_dataframe(scaled_data=True)``. A pandas object, if you
+        still want one, is ``frame.to_pandas()`` on the result. This package
+        does not depend on pandas.
+        """
+        if channels is None:
+            if group is None:
+                selected = self._data_channels()
+            else:
+                selected = self.group(group)._data_channels()
+        else:
+            selected = channels
+        series = self.read_many(
+            selected,
+            start=start,
+            end=end,
+            absolute=True,
+            relative=True,
+            scaled=scaled,
+            basis=basis,
+        )
+        return as_polars(series, time=time, absolute_time=absolute_time, align=align)
+
+    def _data_channels(self):
+        seen = set()
+        out = []
+        for item in self._occurrences():
+            if item.get("is_timestamp"):
+                continue
+            key = (item["group"], item["name"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"name": item["name"], "group": item["group"]})
+        return out
+
+    def _occurrences(self):
+        if self._catalog is None:
+            raise ArgumentError("open a dataset first")
+        return self._catalog.get("channels", [])
+
+    def _rpc(self, header: dict) -> dict:
+        decoded, payload = self._rpc_raw(header)
+        if payload:
+            raise ProtocolError("unexpected payload on a metadata response")
+        return decoded
+
+    def _rpc_raw(self, header: dict):
+        with self._lock:
+            if self._closed:
+                raise GotdmsError("session is closed", "session_closed")
+            if self._proc.poll() is not None:
+                raise ProtocolError(self._dead_message())
+            try:
+                write_frame(self._proc.stdin, header)
+                decoded, payload = read_frame(self._proc.stdout)
+            except ProtocolError:
+                raise
+            except Exception as exc:
+                raise ProtocolError(self._dead_message()) from exc
+        if decoded.get("op") == "error":
+            _raise_protocol(decoded)
+        return decoded, payload
+
+    def _dead_message(self) -> str:
+        err = bytes(self._stderr).decode(errors="replace").strip()
+        if err:
+            return err
+        return f"gotdms-bridge exited {self._proc.returncode}"
+
+
+class Group:
+    """One TDMS group. ``group["channel"]`` matches npTDMS group lookup."""
+
+    def __init__(self, session: Session, name: str):
+        self.session = session
+        self.name = name
+
+    def channels(self):
+        seen = []
+        for item in self.session._occurrences():
+            if item["group"] == self.name and item["name"] not in seen:
+                seen.append(item["name"])
+        return [self.session.channel(name, self.name) for name in seen]
+
+    def __iter__(self):
+        return iter(self.channels())
+
+    def __getitem__(self, name: str) -> Channel:
+        return self.session.channel(name, self.name)
+
+    def properties(self):
+        """Group properties per file. Catalog metadata only."""
+        if self.session._catalog is None:
+            raise ArgumentError("open a dataset first")
+        return [
+            item
+            for item in self.session._catalog.get("groups", [])
+            if item.get("name") == self.name
+        ]
+
+    def as_polars(self, **kwargs):
+        """Data channels in this group, as a Polars frame. Timestamp channels are omitted."""
+        return self.session.as_polars(group=self.name, **kwargs)
+
+    def _data_channels(self):
+        seen = set()
+        out = []
+        for item in self.session._occurrences():
+            if item["group"] != self.name or item.get("is_timestamp"):
+                continue
+            if item["name"] in seen:
+                continue
+            seen.add(item["name"])
+            out.append({"name": item["name"], "group": self.name})
+        return out
+
+
+class Channel:
+    """One channel name in one group, possibly merged across files.
+
+    ``data`` and ``time_track`` each issue a read. Prefer :meth:`Session.read_many`
+    when you need several channels, so the clock is decoded once.
+    """
+
+    def __init__(self, session: Session, name: str, group: str, occurrences: list):
+        self.session = session
+        self.name = name
+        self.group = group
+        self.occurrences = occurrences
+
+    @property
+    def path(self) -> str:
+        return f"{self.group}/{self.name}"
+
+    @property
+    def properties(self) -> dict:
+        """Properties from the first file. See :attr:`properties_match`."""
+        return dict(self.occurrences[0].get("properties") or {})
+
+    @property
+    def properties_match(self) -> bool:
+        import json
+
+        blobs = [
+            json.dumps(item.get("properties") or {}, sort_keys=True, default=str)
+            for item in self.occurrences
+        ]
+        return len(set(blobs)) <= 1
+
+    @property
+    def data_type(self):
+        return self.occurrences[0].get("data_type")
+
+    @property
+    def unit(self):
+        return self.occurrences[0].get("unit") or ""
+
+    @property
+    def scale(self):
+        """The NI linear scale, or None. Presence is not application.
+
+        npTDMS applies this kind of scale unless you opt out. gotdms records
+        it here and applies it only when a read passes ``scaled=True``.
+        """
+        return self.occurrences[0].get("scale")
+
+    @property
+    def has_scale(self) -> bool:
+        return any(item.get("has_scale") for item in self.occurrences)
+
+    @property
+    def has_nonlinear_scale(self) -> bool:
+        return any(item.get("has_nonlinear_scale") for item in self.occurrences)
+
+    @property
+    def is_timestamp(self) -> bool:
+        return any(item.get("is_timestamp") for item in self.occurrences)
+
+    def data(self, **kwargs):
+        """Raw samples as ``float64``, or linear-scaled samples if ``scaled=True``."""
+        return self.session.read(self.name, self.group, **kwargs).y
+
+    def time_track(self, absolute_time: bool = True, **kwargs):
+        """See :meth:`gotdms.codec.Series.time_track`.
+
+        ``absolute_time=False`` is basis-relative. It is not the npTDMS
+        relative track, and this method does not require ``wf_start_time``.
+        The time axis comes from the declared timestamp channel, or from
+        waveform properties when the group has no declaration.
+        """
+        kwargs.pop("absolute", None)
+        kwargs.pop("relative", None)
+        series = self.session.read(self.name, self.group, absolute=True, relative=True, **kwargs)
+        return series.time_track(absolute_time)
+
+    def as_polars(self, **kwargs):
+        return self.session.as_polars(channels=[self], **kwargs)
+
+
+def open(paths=None, *, binary=None, **kwargs) -> Session:
+    """Open a dataset. Close it with :meth:`Session.close` or a ``with`` block.
+
+    This is the eager-session entry. It corresponds to ``TdmsFile.read`` only
+    after you call :meth:`Session.read_all` or :meth:`Session.as_polars`.
+    :meth:`Session.open` itself is the metadata step, like
+    ``TdmsFile.read_metadata``, except declared timestamp channels are read
+    to compute the span.
+    """
+    session = Session(binary=binary)
+    try:
+        session.open(paths, **kwargs)
+    except Exception:
+        session.close()
+        raise
+    return session
+
+
+def _rfc3339(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        value = value.astimezone(timezone.utc)
+        return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    raise ArgumentError("time must be a datetime or an RFC3339 string")
+
+
+def _raise_protocol(decoded: dict):
+    code = decoded.get("code") or "error"
+    message = decoded.get("message") or code
+    if code == "ambiguous":
+        raise AmbiguousChannelError(message, decoded.get("candidates") or [])
+    cls = _CODE_TYPES.get(code, GotdmsError)
+    raise cls(message)

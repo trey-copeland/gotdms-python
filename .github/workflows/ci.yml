@@ -1,0 +1,101 @@
+# CI for github.com/trey-copeland/gotdms-python.
+# The Go module, pyproject.toml, and python/ tree are at the repository root.
+# github.com/trey-copeland/gotdms is required at the pseudo-version in go.mod.
+# There is no replace directive.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (ubuntu, go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.22", "1.27"]
+        include:
+          - go: "1.22"
+            python: true
+            race: true
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: no replace directive
+        run: |
+          if grep -n '^replace ' go.mod; then
+            echo "go.mod must require gotdms by version, not a replace directive"
+            exit 1
+          fi
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test ./...
+
+      - name: race
+        if: matrix.race
+        run: go test -race ./...
+
+      - uses: actions/setup-python@v5
+        if: matrix.python
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies
+        if: matrix.python
+        run: python -m pip install numpy pyarrow polars
+
+      - name: Python unit tests
+        if: matrix.python
+        run: python -m unittest discover -s python/tests
+
+  windows:
+    name: test (windows, go 1.22)
+    runs-on: windows-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test ./...
