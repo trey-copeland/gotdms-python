@@ -658,12 +658,18 @@ func writeErr(w io.Writer, code, msg string, cands []channelJSON) error {
 	return WriteFrame(w, ProtocolVersion, b, nil)
 }
 
+// writeResult sends a result frame. A header that cannot be encoded, or a
+// payload too large for one frame, is sent as an error reply so the session
+// stays usable.
 func writeResult(w io.Writer, header any, payload []byte) error {
 	b, err := json.Marshal(header)
 	if err != nil {
-		return err
+		return writeErr(w, "error", "encode result: "+err.Error(), nil)
 	}
-	return WriteFrame(w, ProtocolVersion, b, payload)
+	if err := checkPayloadLen(uint64(len(payload))); err != nil {
+		return writeErr(w, "error", err.Error(), nil)
+	}
+	return WriteFrame(w, ProtocolVersion, restoreNonFinite(b), payload)
 }
 
 func jsonString(req map[string]json.RawMessage, key string) string {

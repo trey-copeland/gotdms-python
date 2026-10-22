@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 // ProtocolVersion is the frame version this package speaks.
@@ -95,6 +96,9 @@ func WriteFrame(w io.Writer, version uint16, header []byte, payload []byte) erro
 	copy(prefix[0:4], Magic[:])
 	binary.LittleEndian.PutUint16(prefix[4:6], version)
 	binary.LittleEndian.PutUint16(prefix[6:8], 0)
+	if err := checkPayloadLen(uint64(len(payload))); err != nil {
+		return err
+	}
 	binary.LittleEndian.PutUint32(prefix[8:12], uint32(len(header)))
 	binary.LittleEndian.PutUint32(prefix[12:16], uint32(len(payload)))
 	if _, err := w.Write(prefix[:]); err != nil {
@@ -156,4 +160,12 @@ func joinPayload(parts [][]byte) []byte {
 		buf = append(buf, p...)
 	}
 	return buf
+}
+
+// checkPayloadLen reports whether n fits the uint32 payload length field.
+func checkPayloadLen(n uint64) error {
+	if n > math.MaxUint32 {
+		return fmt.Errorf("bridge: payload length %d exceeds %d; read fewer channels at a time", n, uint64(math.MaxUint32))
+	}
+	return nil
 }

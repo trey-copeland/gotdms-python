@@ -342,6 +342,50 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(empty.values.dtype, pl.Null)
         self.assertEqual(got.groups["data"].channels["v"].values.to_list(), [1.0])
 
+    def test_interrupted_append_leaves_file_unchanged(self):
+        import gotdms
+        from gotdms import tdmsfile
+
+        path = self.path("interrupted.tdms")
+        gotdms.write_tdms(path, pl.DataFrame({"v": [1.0, 2.0, 3.0]}))
+        before = Path(path).read_bytes()
+        real = tdmsfile._series_ipc
+        calls = []
+
+        def fail_second(series):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("caller gave up")
+            return real(series)
+
+        tdmsfile._series_ipc = fail_second
+        try:
+            with self.assertRaises(RuntimeError):
+                gotdms.write_tdms(path, pl.DataFrame({"v": [4.0, 5.0, 6.0]}), mode="append", chunk_bytes=8)
+        finally:
+            tdmsfile._series_ipc = real
+        self.assertEqual(Path(path).read_bytes(), before)
+        self.assertEqual(gotdms.read_tdms(path).groups["data"].channels["v"].values.to_list(), [1.0, 2.0, 3.0])
+        gotdms.write_tdms(path, pl.DataFrame({"v": [4.0]}), mode="append")
+        self.assertEqual(
+            gotdms.read_tdms(path).groups["data"].channels["v"].values.to_list(), [1.0, 2.0, 3.0, 4.0]
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes")
+    def test_create_follows_umask_and_keeps_mode(self):
+        import gotdms
+
+        path = self.path("mode.tdms")
+        old = os.umask(0o022)
+        try:
+            gotdms.write_tdms(path, pl.DataFrame({"v": [1.0]}))
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+            os.chmod(path, 0o640)
+            gotdms.write_tdms(path, pl.DataFrame({"v": [2.0]}))
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
+        finally:
+            os.umask(old)
+
     def test_single_frame_group_name(self):
         import gotdms
 

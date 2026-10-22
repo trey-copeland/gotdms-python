@@ -89,7 +89,9 @@ func typedProp(p tdms.Property) map[string]any {
 		}
 		item["value"] = obj
 	case float32:
-		item["value"] = float64(v)
+		item["value"] = jsonFloat(float64(v))
+	case float64:
+		item["value"] = jsonFloat(v)
 	default:
 		item["value"] = v
 	}

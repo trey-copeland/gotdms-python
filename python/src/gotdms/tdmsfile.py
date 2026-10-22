@@ -208,8 +208,13 @@ def write_tdms(
     ``mode="append"`` adds a segment to an existing TDMS file that ends on a
     finished segment. The core writer does not rewrite earlier segments.
     Channels you name gain the new samples. A channel that already has a
-    different type is rejected. An interrupted append can leave an incomplete
-    final segment, which a later append will refuse.
+    different type is rejected. An append that fails or is interrupted is
+    cut back to the file's original length. Only a bridge process that is
+    killed outright, or a lost machine, can leave an incomplete final
+    segment, which a later append will refuse.
+
+    A new file gets the usual mode for the umask, as with ``open(path, "w")``.
+    Replacing an existing file keeps that file's permission bits.
 
     Fixed-size columns, including bool and timestamp, are streamed with
     ``Writer.Stream`` in Arrow chunks of about ``chunk_bytes``. String

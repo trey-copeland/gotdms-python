@@ -2,6 +2,8 @@ package bridge
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -27,6 +30,7 @@ import (
 type fileWrite struct {
 	w          *tdms.Writer
 	file       *os.File // append target; create's file is owned by w
+	origSize   int64    // append: file size before the write, restored on failure
 	path       string
 	tmp        string
 	mode       string
@@ -183,7 +187,8 @@ func (f *fileWrite) open() error {
 		if err != nil {
 			return asArg(err)
 		}
-		if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		size, err := file.Seek(0, io.SeekEnd)
+		if err != nil {
 			file.Close()
 			return asArg(err)
 		}
@@ -193,25 +198,60 @@ func (f *fileWrite) open() error {
 			return asArg(err)
 		}
 		f.file = file
+		f.origSize = size
 		f.w = w
 		return nil
-	} else {
-		dir := filepath.Dir(f.path)
-		base := filepath.Base(f.path)
-		tmp, err := os.CreateTemp(dir, base+".tmp-*")
-		if err != nil {
-			return asArg(err)
-		}
-		tmpName := tmp.Name()
+	}
+	tmp, err := createTemp(f.path)
+	if err != nil {
+		return asArg(err)
+	}
+	tmpName := tmp.Name()
+	w, err := tdms.NewWriter(tmp)
+	if err != nil {
 		tmp.Close()
-		w, err := tdms.Create(tmpName)
-		if err != nil {
-			os.Remove(tmpName)
-			return asArg(err)
+		os.Remove(tmpName)
+		return asArg(err)
+	}
+	f.file = tmp
+	f.tmp = tmpName
+	f.w = w
+	return nil
+}
+
+// createTemp makes an empty file next to path for create mode. Like
+// os.Create it asks for mode 0666 so the umask applies; os.CreateTemp would
+// force 0600. When path already exists the temporary file takes its mode, so
+// replacing a file does not change who can read it.
+func createTemp(path string) (*os.File, error) {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	perm := os.FileMode(0o666)
+	keep := false
+	// Windows has only a read-only bit; copying it would leave a temporary
+	// file that cannot replace the destination or be removed.
+	if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() && runtime.GOOS != "windows" {
+		perm = st.Mode().Perm()
+		keep = true
+	}
+	for i := 0; ; i++ {
+		var b [6]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, err
 		}
-		f.tmp = tmpName
-		f.w = w
-		return nil
+		name := filepath.Join(dir, base+".tmp-"+hex.EncodeToString(b[:]))
+		file, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+		if err != nil {
+			if os.IsExist(err) && i < 100 {
+				continue
+			}
+			return nil, err
+		}
+		if keep {
+			// The umask may have cleared bits the old file had.
+			_ = file.Chmod(perm)
+		}
+		return file, nil
 	}
 }
 
@@ -425,7 +465,11 @@ func (f *fileWrite) finish() (map[string]any, error) {
 	}
 	f.w = nil
 	if f.file != nil {
+		if err := f.file.Sync(); err != nil {
+			return nil, asArg(err)
+		}
 		if err := f.file.Close(); err != nil {
+			f.file = nil
 			return nil, asArg(err)
 		}
 		f.file = nil
@@ -439,8 +483,12 @@ func (f *fileWrite) finish() (map[string]any, error) {
 		return nil, asArg(err)
 	}
 	segs := tf.SegmentCount()
+	complete := tf.Status().Complete
 	if err := tf.Close(); err != nil {
 		return nil, asArg(err)
+	}
+	if !complete {
+		return nil, errCode("argument", "written file does not end on a finished segment")
 	}
 	if f.mode == "create" {
 		if err := replaceFile(f.tmp, f.path); err != nil {
@@ -472,15 +520,25 @@ func (f *fileWrite) shortError() error {
 	return errCode("argument", "write ended before every channel was received")
 }
 
+// abort drops an unfinished write. create removes its temporary file. append
+// cuts the target back to its size before the write, so a reader never sees
+// part of an append and the file still accepts the next one.
 func (f *fileWrite) abort() {
 	if f == nil || f.committed {
 		return
 	}
-	if f.w != nil {
-		if f.mode == "create" || f.touched {
-			_ = f.w.Close()
+	// The writer is not closed: closing would finish the partial segment.
+	f.w = nil
+	if f.mode == "append" {
+		if f.file != nil {
+			_ = f.file.Truncate(f.origSize)
+			_ = f.file.Close()
+			f.file = nil
+		} else if f.origSize > 0 {
+			// finish closed the file before it failed.
+			_ = os.Truncate(f.path, f.origSize)
 		}
-		f.w = nil
+		return
 	}
 	if f.file != nil {
 		_ = f.file.Close()
@@ -492,18 +550,23 @@ func (f *fileWrite) abort() {
 	}
 }
 
+// replaceFile moves tmp over path. It never deletes path first, so a failed
+// move leaves the old file in place. os.Rename replaces an existing file on
+// every supported OS. On Windows a scanner or indexer can hold either file
+// open for a moment, so the move is retried briefly there.
 func replaceFile(tmp, path string) error {
 	err := os.Rename(tmp, path)
-	if err == nil {
-		return nil
-	}
-	if _, statErr := os.Stat(path); statErr != nil {
+	if err == nil || runtime.GOOS != "windows" {
 		return err
 	}
-	if rmErr := os.Remove(path); rmErr != nil {
-		return err
+	for i := 1; i <= 10 && err != nil; i++ {
+		if _, statErr := os.Stat(tmp); statErr != nil {
+			return err
+		}
+		time.Sleep(time.Duration(i) * 20 * time.Millisecond)
+		err = os.Rename(tmp, path)
 	}
-	return os.Rename(tmp, path)
+	return err
 }
 
 func inspectAppend(path string) (map[string]tdms.DataType, error) {

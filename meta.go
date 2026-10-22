@@ -109,7 +109,11 @@ func propsToMap(props []tdms.Property) map[string]any {
 
 func propJSON(p tdms.Property) any {
 	switch v := p.Value.(type) {
-	case string, bool, float32, float64,
+	case float32:
+		return jsonFloat(float64(v))
+	case float64:
+		return jsonFloat(v)
+	case string, bool,
 		int8, int16, int32, int64,
 		uint8, uint16, uint32, uint64:
 		return v

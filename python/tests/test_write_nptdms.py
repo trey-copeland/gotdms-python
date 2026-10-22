@@ -54,6 +54,39 @@ class NptdmsOracleTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    def test_nonfinite_properties_read(self):
+        """NaN and infinite float properties come back as floats, not a dead bridge."""
+        import math
+
+        import gotdms
+        from nptdms import ChannelObject, GroupObject, RootObject, TdmsWriter
+
+        path = str(Path(self.tmp.name) / "nonfinite.tdms")
+        with TdmsWriter(path) as w:
+            w.write_segment(
+                [
+                    RootObject(properties={"nan": float("nan")}),
+                    GroupObject("data", properties={"low": float("-inf")}),
+                    ChannelObject(
+                        "data",
+                        "v",
+                        np.array([1.0, 2.0]),
+                        properties={"high": float("inf"), "gain": 1.5},
+                    ),
+                ]
+            )
+        got = gotdms.read_tdms(path)
+        self.assertTrue(math.isnan(got.properties["nan"]))
+        self.assertEqual(got.groups["data"].properties["low"], float("-inf"))
+        ch = got.groups["data"].channels["v"]
+        self.assertEqual(ch.properties["high"], float("inf"))
+        self.assertEqual(ch.properties["gain"], 1.5)
+        self.assertEqual(ch.values.to_list(), [1.0, 2.0])
+        with gotdms.open([path]) as session:
+            props = session.channel("v").properties
+            self.assertEqual(props["high"], float("inf"))
+            self.assertEqual(session.read("v").samples, 2)
+
     def test_goban_layout_matches_nptdms(self):
         path = str(Path(self.tmp.name) / "goban.tdms")
         _result, when, frac = goban_write(path)

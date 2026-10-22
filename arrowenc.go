@@ -152,7 +152,9 @@ func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, scaled, prop
 
 func schemaMeta(m channelOut) arrow.Metadata {
 	props, _ := json.Marshal(m.Properties)
+	props = restoreNonFinite(props)
 	files, _ := json.Marshal(m.Files)
+	files = restoreNonFinite(files)
 	gaps, _ := json.Marshal(m.Gaps)
 	keys := []string{
 		"gotdms.name", "gotdms.group", "gotdms.data_type", "gotdms.timed",
