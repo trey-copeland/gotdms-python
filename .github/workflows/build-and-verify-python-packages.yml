@@ -1,7 +1,7 @@
 # Build an sdist and a linux/amd64 wheel from the repository root.
-# go.mod requires github.com/trey-copeland/gotdms at a pseudo-version, so
-# the Go build downloads that module. This workflow does not check out
-# gotdms or add a replace directive.
+# go.mod requires github.com/trey-copeland/gotdms at the tagged version in
+# that file, so the Go build downloads that module. This workflow does not
+# check out gotdms or add a replace directive.
 
 name: 'Build and verify Python packages'
 

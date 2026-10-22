@@ -2,14 +2,15 @@ module github.com/trey-copeland/gotdms-python
 
 go 1.22.0
 
-// github.com/trey-copeland/gotdms has no release tag. This pseudo-version is
-// gotdms main at 622cb34bacb80fd810d46ee77183e2bae80bf52d, which includes the
-// dataset API, Writer.Stream, and DAQmx raw reads (index words 0x1269,
-// 0x1369, and 0x126A). Switch the requirement to v0.1.0 once that tag
-// exists. See EXTRACTION.md.
+// github.com/trey-copeland/gotdms v0.1.1 is commit
+// 7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8. v0.1.0 is
+// 622cb34bacb80fd810d46ee77183e2bae80bf52d. v0.1.1 fixes ReadValues and
+// Group.Values for interleaved channels that span more than one segment,
+// and writes segment-index sidecars as version 2. This module does not
+// build those sidecars. See EXTRACTION.md.
 require (
 	github.com/apache/arrow-go/v18 v18.0.0
-	github.com/trey-copeland/gotdms v0.0.0-20261022022333-622cb34bacb8
+	github.com/trey-copeland/gotdms v0.1.1
 )
 
 require (

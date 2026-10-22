@@ -72,4 +72,4 @@ Python 3.10 or newer. The client and the bridge speak protocol version 1. That p
 
 This repository is [gotdms-python](https://github.com/trey-copeland/gotdms-python). The proposed PyPI distribution name is `gotdms`. The import package is `gotdms`. Nothing has been published to PyPI, and this repository has no release tag. `0.1.0` in `pyproject.toml` is the version recorded for that first release. It is not a tag.
 
-The Go module requires [gotdms](https://github.com/trey-copeland/gotdms) at `v0.0.0-20261022022333-622cb34bacb8`, which is gotdms `main` commit `622cb34bacb80fd810d46ee77183e2bae80bf52d`. That commit has the dataset API, `Writer.Stream`, and DAQmx raw reads. gotdms has no release tag yet. When `v0.1.0` is tagged there, this requirement should become `github.com/trey-copeland/gotdms v0.1.0`. There is no `replace` directive. See [`EXTRACTION.md`](EXTRACTION.md).
+The Go module requires [gotdms](https://github.com/trey-copeland/gotdms) `v0.1.1` (`7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8`). That tag is `v0.1.0` plus the interleaved multi-segment read fix. There is no `replace` directive. See [`EXTRACTION.md`](EXTRACTION.md).

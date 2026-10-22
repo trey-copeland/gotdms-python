@@ -13,18 +13,18 @@ Nothing has been tagged in this repository. `pyproject.toml` records version `0.
 
 ## Core module pin
 
-gotdms has no release tag. `go.mod` requires:
+`go.mod` requires:
 
 ```
-github.com/trey-copeland/gotdms v0.0.0-20261022022333-622cb34bacb8
+github.com/trey-copeland/gotdms v0.1.1
 ```
 
-That pseudo-version is commit `622cb34bacb80fd810d46ee77183e2bae80bf52d` on gotdms `main`. It includes the dataset API this binary imports (declared timestamp channels, basis, `ReadMany`), `Writer.Stream`, which the write ops use, and DAQmx raw reads (index words `0x1269`, `0x1369`, and `0x126A`). There is no `replace` directive. `go build` and `go test` download this module.
+`v0.1.1` is commit `7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8`. `v0.1.0` is `622cb34bacb80fd810d46ee77183e2bae80bf52d`, which already has the dataset API this binary imports (declared timestamp channels, basis, `ReadMany`), `Writer.Stream`, and DAQmx raw reads (index words `0x1269`, `0x1369`, and `0x126A`). `v0.1.1` fixes `ReadValues` and `Group.Values` for an interleaved channel that continues in a later segment. It also writes segment-index sidecars as version 2. This package does not call `WithSegmentIndex` or `BuildSegmentIndex`, so it does not build those sidecars. A reader built with gotdms `v0.1.0` treats a version 2 sidecar as a miss. There is no `replace` directive. `go build` and `go test` download this module.
 
-When gotdms is tagged `v0.1.0` from that commit or a later one that still contains the dataset API, switch the requirement:
+To move the pin:
 
 ```bash
-go get github.com/trey-copeland/gotdms@v0.1.0
+go get github.com/trey-copeland/gotdms@v0.1.1
 go mod tidy
 go test ./...
 ```
@@ -38,7 +38,7 @@ While this tree lived inside gotdms, an sdist vendored the parent module at `thi
 This repository does not do that.
 
 - `python scripts/build_dist.py` and `python -m build` do not edit `go.mod` and do not vendor gotdms.
-- The wheel build runs `go build -trimpath` with `CGO_ENABLED=0`. The Go command resolves gotdms at the pseudo-version above, and the other modules in `go.sum`, from the module proxy.
+- The wheel build runs `go build -trimpath` with `CGO_ENABLED=0`. The Go command resolves gotdms at the version above, and the other modules in `go.sum`, from the module proxy.
 - A source install needs Go on `PATH` and network access to the module proxy, the same way it needs them for `github.com/apache/arrow-go/v18`.
 - `GOTDMS_PLAT_TAG`, `GOOS`, and `GOARCH` are still how a cross-compile selects the wheel tag. With those unset, the wheel is tagged for the host.
 
@@ -50,7 +50,7 @@ This repository does not do that.
 
 The core module, this Go module, and the Python package version independently.
 
-- Core tags (`v0.1.0` and later) are the gotdms reader. They are not this package's version. Until the first core tag, the pin above is the source of truth.
-- Python `0.1.0` in `pyproject.toml` is this wrapper. The first Git tag of this repo should be `v0.1.0` so the Go module version and the Python version match for that first release. Later tags may diverge. Say so in the changelog when they do.
+- Core tags (`v0.1.0` and later) are the gotdms reader. They are not this package's version. The pin above is the source of truth for which core tag this binary builds against. That pin is `v0.1.1`, which is newer than this package's unreleased `0.1.0`.
+- Python `0.1.0` in `pyproject.toml` is this wrapper. Nothing in this repository has been tagged. The first Git tag of this repo can still be `v0.1.0`. It will not match the core tag, because the core module is already at `v0.1.1`. Say so in the changelog when this package is tagged.
 - The compatibility contract with a running `gotdms-bridge` is protocol version 1 (`ProtocolVersion` in `frame.go`), not the core tag. A bridge and a client disagree when that number disagrees.
-- The minimum core source this binary can compile is the dataset API. That API is the commit pinned in `go.mod`. No released core tag provides it yet.
+- The minimum core source this binary can compile is the dataset API. That API is in gotdms `v0.1.0` and `v0.1.1`. The pin in `go.mod` is `v0.1.1`.
