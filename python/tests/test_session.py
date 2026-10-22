@@ -25,7 +25,7 @@ class BridgeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.bin = Path(cls.tmp.name) / "gotdms-bridge"
+        cls.bin = Path(cls.tmp.name) / ("gotdms-bridge.exe" if os.name == "nt" else "gotdms-bridge")
         subprocess.check_call(
             ["go", "build", "-o", str(cls.bin), "./cmd/gotdms-bridge"],
             cwd=ROOT,
@@ -59,7 +59,7 @@ class BridgeTest(unittest.TestCase):
 
         dest_dir = Path(gotdms.__file__).resolve().parent / "_bin"
         dest_dir.mkdir(exist_ok=True)
-        dest = dest_dir / "gotdms-bridge"
+        dest = dest_dir / ("gotdms-bridge.exe" if os.name == "nt" else "gotdms-bridge")
         shutil.copy(self.bin, dest)
         dest.chmod(0o755)
         saved = os.environ.pop("GOTDMS_BRIDGE")

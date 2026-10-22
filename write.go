@@ -248,8 +248,13 @@ func createTemp(path string) (*os.File, error) {
 			return nil, err
 		}
 		if keep {
-			// The umask may have cleared bits the old file had.
-			_ = file.Chmod(perm)
+			// OpenFile applied the umask. Put the previous mode back so the
+			// replaced file does not lose group or other bits the umask clears.
+			if err := file.Chmod(perm); err != nil {
+				file.Close()
+				os.Remove(name)
+				return nil, err
+			}
 		}
 		return file, nil
 	}

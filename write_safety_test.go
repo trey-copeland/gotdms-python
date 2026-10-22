@@ -248,6 +248,33 @@ func TestNonFinitePropertiesInHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("open", h)
+
+	out := t.TempDir()
+	if err := Convert(ConvertOptions{Paths: []string{path}, OutDir: out}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(out, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(manifest, []byte("gotdms-nonfinite")) {
+		t.Fatalf("placeholder left in manifest: %s", manifest)
+	}
+	// The manifest records channel properties. File and group properties stay
+	// on the catalog, so -Infinity (a group property) is not in this file.
+	for _, tok := range []string{"NaN", "Infinity"} {
+		if !bytes.Contains(manifest, []byte(tok)) {
+			t.Fatalf("manifest lacks %s: %s", tok, manifest)
+		}
+	}
+	clean := manifest
+	for _, tok := range []string{"-Infinity", "Infinity", "NaN"} {
+		clean = bytes.ReplaceAll(clean, []byte(tok), []byte("null"))
+	}
+	var parsed any
+	if err := json.Unmarshal(clean, &parsed); err != nil {
+		t.Fatalf("manifest: %v: %s", err, manifest)
+	}
 }
 
 // A header that cannot be encoded is an error reply, not a dead session.
