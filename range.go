@@ -33,7 +33,7 @@ func (s *session) readLimited(sels []dataset.Selector, offset, limit int, basis 
 		if err != nil {
 			return nil, nil, err
 		}
-		ser, err := s.seriesRange(sel, hits, offset, limit, basis, cache)
+		ser, err := s.seriesRange(sel, hits, offset, limit, basis, cache, indexOpts{}, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -43,9 +43,10 @@ func (s *session) readLimited(sels []dataset.Selector, offset, limit int, basis 
 }
 
 type fileCache struct {
-	files map[string]*tdms.File
-	axis  map[string]*axisBuf
-	reads []spanRead
+	files  map[string]*tdms.File
+	axis   map[string]*axisBuf
+	reads  []spanRead
+	scaled map[string][]float64
 }
 
 type axisBuf struct {
@@ -81,7 +82,7 @@ func (c *fileCache) note(file, group, name, role string, offset, n, total int) {
 	})
 }
 
-func (s *session) seriesRange(sel dataset.Selector, hits []dataset.Occurrence, offset, limit int, basis time.Time, cache *fileCache) (dataset.Series, error) {
+func (s *session) seriesRange(sel dataset.Selector, hits []dataset.Occurrence, offset, limit int, basis time.Time, cache *fileCache, opt indexOpts, nat *nativeCol) (dataset.Series, error) {
 	if len(hits) == 0 {
 		return dataset.Series{}, fmt.Errorf("%w: %q", dataset.ErrNotFound, sel.Name)
 	}
@@ -101,8 +102,11 @@ func (s *session) seriesRange(sel dataset.Selector, hits []dataset.Occurrence, o
 	if sel.Group != "" {
 		ser.Group = sel.Group
 	}
+	if opt.window && !hits[0].Timed {
+		return dataset.Series{}, fmt.Errorf("%w: %q", dataset.ErrUntimed, hits[0].Name)
+	}
 	if !hits[0].Timed {
-		return s.untimedRange(ser, hits, offset, limit, cache)
+		return s.untimedRange(ser, hits, offset, limit, cache, opt, nat)
 	}
 	if limit >= 0 && offset > math.MaxInt-limit {
 		return dataset.Series{}, fmt.Errorf("%w: sample range overflows", dataset.ErrArgument)
@@ -139,6 +143,15 @@ func (s *session) seriesRange(sel dataset.Selector, hits []dataset.Occurrence, o
 			return dataset.Series{}, err
 		}
 	}
+	if opt.window {
+		kept := make([]sampleRef, 0, len(state))
+		for _, sm := range state {
+			if !sm.t.Before(opt.start) && sm.t.Before(opt.end) {
+				kept = append(kept, sm)
+			}
+		}
+		state = kept
+	}
 	if offset > len(state) {
 		offset = len(state)
 	}
@@ -147,7 +160,7 @@ func (s *session) seriesRange(sel dataset.Selector, hits []dataset.Occurrence, o
 		end = offset + limit
 	}
 	window := state[offset:end]
-	if err := s.fillY(sel, hits, window, cache); err != nil {
+	if err := s.fillY(sel, hits, window, cache, opt, nat); err != nil {
 		return dataset.Series{}, err
 	}
 	ser.Y = make([]float64, len(window))
@@ -172,7 +185,7 @@ func (s *session) seriesRange(sel dataset.Selector, hits []dataset.Occurrence, o
 	return ser, nil
 }
 
-func (s *session) untimedRange(ser dataset.Series, hits []dataset.Occurrence, offset, limit int, cache *fileCache) (dataset.Series, error) {
+func (s *session) untimedRange(ser dataset.Series, hits []dataset.Occurrence, offset, limit int, cache *fileCache, opt indexOpts, nat *nativeCol) (dataset.Series, error) {
 	ordered := append([]dataset.Occurrence(nil), hits...)
 	sortOccurrences(ordered, func(a, b dataset.Occurrence) bool { return a.File < b.File })
 	total := 0
@@ -222,8 +235,7 @@ func (s *session) untimedRange(ser dataset.Series, hits []dataset.Occurrence, of
 		if !ok {
 			return dataset.Series{}, fmt.Errorf("%w: %s", dataset.ErrNotFound, o.Name)
 		}
-		cache.note(o.File, o.Group, o.Name, "data", local, n, ch.Len())
-		part, err := readFloatRange(ch, local, n)
+		part, err := s.takeSamples(ch, o.File, o.Group, o.Name, local, n, cache, opt, nat)
 		if err != nil {
 			return dataset.Series{}, err
 		}
@@ -460,7 +472,7 @@ func (s *session) waveformTimes(o dataset.Occurrence, n int, cache *fileCache) (
 	return times, nil
 }
 
-func (s *session) fillY(sel dataset.Selector, hits []dataset.Occurrence, window []sampleRef, cache *fileCache) error {
+func (s *session) fillY(sel dataset.Selector, hits []dataset.Occurrence, window []sampleRef, cache *fileCache, opt indexOpts, nat *nativeCol) error {
 	if len(window) == 0 {
 		return nil
 	}
@@ -478,7 +490,8 @@ func (s *session) fillY(sel dataset.Selector, hits []dataset.Occurrence, window 
 		o := byFile[file]
 		start := window[i].index
 		n := window[j-1].index - start + 1
-		if o.IsTimestamp {
+		info := s.meta[chKey{file: file, group: o.Group, name: sel.Name}]
+		if !info.daqmx && o.IsTimestamp {
 			key := o.File + "\x00" + o.Group + "\x00" + clockName(o)
 			buf := cache.axis[key]
 			if buf == nil || start+n > len(buf.y) {
@@ -490,26 +503,26 @@ func (s *session) fillY(sel dataset.Selector, hits []dataset.Occurrence, window 
 			for k := i; k < j; k++ {
 				window[k].y = buf.y[window[k].index]
 			}
-		} else {
-			f, err := cache.open(file)
-			if err != nil {
-				return err
-			}
-			ch, err := channelOf(f, o.Group, sel.Name)
-			if err != nil {
-				return err
-			}
-			cache.note(file, o.Group, sel.Name, "data", start, n, ch.Len())
-			ys, err := readFloatRange(ch, start, n)
-			if err != nil {
-				return err
-			}
-			if len(ys) != n {
-				return fmt.Errorf("%w: read %d of %d", dataset.ErrArgument, len(ys), n)
-			}
-			for k := i; k < j; k++ {
-				window[k].y = ys[window[k].index-start]
-			}
+			i = j
+			continue
+		}
+		f, err := cache.open(file)
+		if err != nil {
+			return err
+		}
+		ch, err := channelOf(f, o.Group, sel.Name)
+		if err != nil {
+			return err
+		}
+		ys, err := s.takeSamples(ch, file, o.Group, sel.Name, start, n, cache, opt, nat)
+		if err != nil {
+			return err
+		}
+		if len(ys) != n {
+			return fmt.Errorf("%w: read %d of %d", dataset.ErrArgument, len(ys), n)
+		}
+		for k := i; k < j; k++ {
+			window[k].y = ys[window[k].index-start]
 		}
 		i = j
 	}

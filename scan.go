@@ -232,21 +232,7 @@ func describeFile(path string, spec parsedSource) (fileMeta, []groupMeta, []chan
 			}
 		}
 		for _, ch := range chans {
-			info := scaleInfo{
-				dataType:   ch.DataType().String(),
-				properties: propsToMap(ch.Properties()),
-				samples:    ch.Len(),
-			}
-			if u, ok := ch.Unit(); ok {
-				info.unit = u
-			}
-			if sc, ok := ch.LinearScale(); ok {
-				info.hasLinear = true
-				info.slope = sc.Slope
-				info.intercept = sc.Intercept
-				info.index = sc.Index
-			}
-			info.nonlinear = nonlinearScale(ch)
+			info := inspectChannel(ch)
 			c := channelJSON{
 				Name:         ch.Name(),
 				Group:        ch.GroupName(),
@@ -256,6 +242,9 @@ func describeFile(path string, spec parsedSource) (fileMeta, []groupMeta, []chan
 				Unit:         info.unit,
 				HasScale:     info.hasLinear,
 				HasNonlinear: info.nonlinear,
+				DAQmx:        info.daqmx,
+				Digital:      info.digital,
+				DAQmxScale:   info.willScale,
 				Properties:   info.properties,
 				Source:       dataset.TimeNone.String(),
 			}

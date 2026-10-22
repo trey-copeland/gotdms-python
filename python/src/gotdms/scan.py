@@ -140,7 +140,7 @@ def scan_tdms(
     for column in data_columns:
         name = f"{column['group']}/{column['name']}"
         by_name[name] = column
-        schema[name] = pl.Float64
+        schema[name] = _polars_dtype(pl, column, scaled)
     time_only = _time_only_specs(data_columns)
 
     def io_source(with_columns, predicate, n_rows, batch_size):
@@ -222,6 +222,31 @@ def scan_tdms(
     )
     frame.gotdms_sample_reads = described.get("sample_reads", 0)
     return frame
+
+
+def _polars_dtype(pl, column, scaled):
+    """Column dtype for a scan schema.
+
+    Ordinary channels are float64, which is what ``Session.read`` returns.
+    A DAQmx channel uses the primary scaler's stored type unless ``scaled``
+    is set. ``scaled=True`` is float64 engineering units. Digital lines are
+    UInt8 of 0 and 1.
+    """
+    if scaled or not column.get("daqmx"):
+        return pl.Float64
+    return {
+        "tdsTypeI8": pl.Int8,
+        "tdsTypeI16": pl.Int16,
+        "tdsTypeI32": pl.Int32,
+        "tdsTypeI64": pl.Int64,
+        "tdsTypeU8": pl.UInt8,
+        "tdsTypeU16": pl.UInt16,
+        "tdsTypeU32": pl.UInt32,
+        "tdsTypeU64": pl.UInt64,
+        "tdsTypeSingleFloat": pl.Float32,
+        "tdsTypeDoubleFloat": pl.Float64,
+        "tdsTypeTimeStamp": pl.Datetime("ns", "UTC"),
+    }.get(column.get("data_type"), pl.Float64)
 
 
 def _import_polars():

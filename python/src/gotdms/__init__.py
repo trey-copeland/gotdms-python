@@ -9,8 +9,9 @@ Polars, and pyarrow are required. This package does not depend on pandas.
 A caller who wants a pandas object can use Polars' ``to_pandas()``.
 
 ``write_tdms`` writes Polars frames to a TDMS file. ``read_tdms`` reads
-those samples back in the stored type. ``open`` still returns float64 and
-is the dataset path.
+those samples back in the stored type. ``open`` returns float64 for an
+ordinary channel. A DAQmx channel stays in the primary scaler's stored
+type, and a digital line is uint8, unless a read passes ``scaled=True``.
 
 Wheels bundle ``gotdms-bridge``. ``locate_binary`` uses an explicit path,
 then ``GOTDMS_BRIDGE``, then that bundled file.

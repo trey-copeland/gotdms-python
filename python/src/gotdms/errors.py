@@ -58,11 +58,13 @@ class UntimedError(GotdmsError):
 
 
 class NoScaleError(GotdmsError):
-    """``scaled=True`` was requested and the channel has no NI linear scale.
+    """``scaled=True`` was requested and the channel has no scale to apply.
 
-    The raw samples are not returned in this case. npTDMS applies scaling by
-    default and returns raw data only when asked; gotdms does the opposite
-    and refuses to pretend a scale exists.
+    For an ordinary channel that is an NI linear scale. For a DAQmx channel
+    it is a linear or polynomial chain, or ``NI_Scaling_Status`` of
+    ``scaled``. The raw samples are not returned in this case. npTDMS applies
+    scaling by default and returns raw data only when asked; gotdms does the
+    opposite and refuses to pretend a scale exists.
     """
 
     def __init__(self, message):
@@ -70,7 +72,12 @@ class NoScaleError(GotdmsError):
 
 
 class NonlinearScaleError(GotdmsError):
-    """The channel has a non-linear NI scale. gotdms does not apply it."""
+    """The channel has a scale type this bridge does not apply.
+
+    Ordinary channels accept only ``Linear``. DAQmx channels accept linear
+    and polynomial chains. Any other scale type raises this error and is
+    not applied.
+    """
 
     def __init__(self, message):
         super().__init__(message, "nonlinear_scale")

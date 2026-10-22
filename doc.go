@@ -10,7 +10,9 @@
 // IPC stream per channel. The Python client turns those streams into Polars
 // frames. gotdms returns raw samples. A linear scale is
 // applied only when the request sets scaled, and only when every contributing
-// file has the same NI linear scale.
+// file has the same NI linear scale. A DAQmx channel is the primary scaler's
+// stored type (digital lines are uint8). scaled=True on a DAQmx channel
+// applies DAQmxScaledFloat64s and returns float64. No scale is an error.
 //
 // describe returns the same catalog fields as open and does not decode
 // channel samples. read and read_many accept an optional sample offset and

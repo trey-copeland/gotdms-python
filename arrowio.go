@@ -15,7 +15,9 @@ import (
 
 // wireOf is the protocol name for a TDMS type this bridge can put in a
 // Polars column. Float-with-unit uses the plain float wire name; ni_type
-// keeps the NI enum name. ok is false for extended, complex, and DAQmx.
+// keeps the NI enum name. ok is false for extended and complex values.
+// A decoded DAQmx channel's DataType is the primary scaler, so it uses
+// that scaler's wire name. Digital lines are uint8.
 func wireOf(dt tdms.DataType) (string, bool) {
 	switch dt {
 	case tdms.TypeInt8:

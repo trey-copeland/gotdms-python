@@ -155,7 +155,9 @@ gotdms returns the stored samples. `Channel.LinearScale` in the core library is 
 
 When an `NI_Scale[i]_Scale_Type` of `Linear` is present, with a slope and intercept, the catalog and the Arrow schema carry `has_scale`, `scale.slope`, `scale.intercept`, and `scale.index`. `scaled=True` (or `--scaled`) applies `raw * slope + intercept`, the same arithmetic as `LinearScale.Apply`. The response sets `scaled` so you can see that it happened.
 
-`scaled=True` on a channel with no linear scale raises `NoScaleError`. The bridge does not return raw data under that flag. A scale whose type is not `Linear` raises `NonlinearScaleError` and is not applied. If the files of one merged channel disagree on the linear scale, `scaled=True` raises `ScaleMismatchError`.
+`scaled=True` on an ordinary channel with no linear scale raises `NoScaleError`. The bridge does not return raw data under that flag. A scale whose type is not `Linear` raises `NonlinearScaleError` and is not applied. If the files of one merged channel disagree on the linear scale, `scaled=True` raises `ScaleMismatchError`.
+
+A DAQmx channel is different. `open`, `read`, `read_tdms`, and `scan_tdms` return the primary scaler's stored type, raw. A digital line (`0x126A`) is `UInt8` with values 0 and 1. `scaled=True` calls `DAQmxScaledFloat64s`: a linear or polynomial chain becomes float64 engineering units. `NI_Scaling_Status` of `scaled` means those stored samples are already engineering units, so the flag returns them as float64 and sets `scaled`. No DAQmx scale raises `NoScaleError`. A scale type other than linear or polynomial raises `NonlinearScaleError`. The Polars column is the primary scaler. Other scalers on that channel are not extra columns. `write_tdms` does not emit a DAQmx raw index.
 
 npTDMS does the opposite on purpose: data read from a channel is scaled, and raw samples are `raw_data` or `read_data(scaled=False)`. `as_dataframe(scaled_data=True)` is the npTDMS default. Do not treat a gotdms array as engineering units unless `scaled` was set and the response says so.
 
@@ -302,7 +304,7 @@ Datetime columns are TDMS timestamps and come back as `Datetime(ns, UTC)`. A nai
 
 Properties are bool, int, float, str, datetime, or `gotdms.Property(value, tdms_type)` when the width matters. A plain int is int32 when it fits and int64 otherwise. Waveform fields are `wf_start_time`, `wf_increment`, `wf_start_offset`, and `wf_samples`. If a waveform dict omits `wf_samples`, it is the column length. Waveform fields belong on numeric channels. The same name cannot be both a waveform field and a channel property.
 
-`read_tdms` returns those stored types. `Session.read`, `channel.data()`, and `as_polars` still return float64 and still reject a string channel. Open the file with `gotdms.open` to catalog it, including a log group, and use `read_tdms` when the log strings or the integer width matter. Integer channels wider than the float64 mantissa are still float64 on that dataset path.
+`read_tdms` returns those stored types. `Session.read`, `channel.data()`, and `as_polars` still return float64 for an ordinary numeric channel and still reject a string channel. A DAQmx channel is the primary scaler's stored type on those paths too. Open the file with `gotdms.open` to catalog it, including a log group, and use `read_tdms` when the log strings or the integer width matter. An ordinary integer wider than the float64 mantissa is still float64 on that dataset path.
 
 Fixed-size columns, including bool and timestamp, are streamed with `Writer.Stream` in Arrow chunks. String columns cannot be streamed, because the offset table needs every length, so they are buffered and written as a following segment when the file also has fixed-size columns.
 
@@ -310,12 +312,12 @@ npTDMS reads the file this writes. `read_data(scaled=False)` is the raw samples.
 
 ## Gaps that remain
 
-- DAQmx is not supported. There is no DAQmx scaler map and no DAQmx scaling. A raw DAQmx channel is not turned into engineering units.
-- Non-linear NI scales are reported and not applied.
+- DAQmx writes are not supported. Reads return the primary scaler, raw, and `scaled=True` applies only a linear or polynomial DAQmx chain.
+- Non-linear NI scales on an ordinary channel are reported and not applied. A DAQmx polynomial chain is applied when `scaled=True`.
 - No HDF5 export.
 - No `tdmsinfo` CLI.
 - Memory mapping is intentionally absent.
-- `Channel.Slice` and `CursorAt` read a sample range without walking earlier samples. Dataset time windows do not use them: a waveform window still starts its cursor at sample 0, and a timestamp axis is decoded in full. `offset` and `limit` on `read` and `read_many` are a bridge range read. They call `Slice` for the merged sample range and do not decode the other samples of the selected channels. A full read, and any `start`/`end` window, still goes through dataset. `describe` does not read samples. `open` still learns each file's span from declared clocks (first two samples when the first step is positive, otherwise the whole clock). That catalog read is not listed in `reads`. A `head` or `limit` on `scan_tdms` does not move `basis`.
+- `Channel.Slice` and `CursorAt` read a sample range without walking earlier samples. Dataset time windows do not use them: a waveform window still starts its cursor at sample 0, and a timestamp axis is decoded in full. `offset` and `limit` on `read` and `read_many` are a bridge range read. They call `Slice` for the merged sample range and do not decode the other samples of the selected channels. A full read of an ordinary channel, and any `start`/`end` window on one, still goes through dataset. A DAQmx read uses the same index path for a full span, a sample range, and a time window, and the Arrow column keeps the scaler type. `describe` does not read samples. `open` still learns each file's span from declared clocks (first two samples when the first step is positive, otherwise the whole clock). That catalog read is not listed in `reads`. A `head` or `limit` on `scan_tdms` does not move `basis`.
 - Eager `read_all` is an explicit call. `open` alone does not pull every sample into Python.
 - File-status for an incomplete final segment is the core reader's behavior; the bridge does not add an npTDMS `file_status` object.
-- Integers wider than the float64 mantissa are returned as `float64` from `Session.read`, `channel.data()`, and `as_polars`, which is what the dataset layer already does. `read_tdms` keeps the stored width, including int64 and uint64 past 2^53.
+- Ordinary integers wider than the float64 mantissa are returned as `float64` from `Session.read`, `channel.data()`, and `as_polars`, which is what the dataset layer already does. `read_tdms` keeps the stored width, including int64 and uint64 past 2^53. A DAQmx scaler keeps that width on `read` and `scan_tdms` as well.

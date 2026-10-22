@@ -16,10 +16,10 @@ Nothing has been tagged in this repository. `pyproject.toml` records version `0.
 gotdms has no release tag. `go.mod` requires:
 
 ```
-github.com/trey-copeland/gotdms v0.0.0-20261019115415-9ad35ef91606
+github.com/trey-copeland/gotdms v0.0.0-20261022022333-622cb34bacb8
 ```
 
-That pseudo-version is commit `9ad35ef91606a11bac250d0fc763f32fab09b6b8` on gotdms `main`. It includes the dataset API this binary imports (declared timestamp channels, basis, `ReadMany`) and `Writer.Stream`, which the write ops use. There is no `replace` directive. `go build` and `go test` download this module.
+That pseudo-version is commit `622cb34bacb80fd810d46ee77183e2bae80bf52d` on gotdms `main`. It includes the dataset API this binary imports (declared timestamp channels, basis, `ReadMany`), `Writer.Stream`, which the write ops use, and DAQmx raw reads (index words `0x1269`, `0x1369`, and `0x126A`). There is no `replace` directive. `go build` and `go test` download this module.
 
 When gotdms is tagged `v0.1.0` from that commit or a later one that still contains the dataset API, switch the requirement:
 

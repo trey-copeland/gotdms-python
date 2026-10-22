@@ -38,13 +38,20 @@ func readValues(path string) (any, []byte, error) {
 				return nil, nil, err
 			}
 			parts = append(parts, blob)
-			chans = append(chans, map[string]any{
+			item := map[string]any{
 				"name":       ch.Name(),
 				"type":       wire,
 				"ni_type":    ch.DataType().String(),
 				"rows":       ch.Len(),
 				"properties": typedProps(ch.Properties()),
-			})
+			}
+			if raw, ok := ch.DAQmx(); ok {
+				item["daqmx"] = true
+				if raw.Primary >= 0 && raw.Primary < len(raw.Scalers) && raw.Scalers[raw.Primary].Digital {
+					item["digital"] = true
+				}
+			}
+			chans = append(chans, item)
 		}
 		groups = append(groups, map[string]any{
 			"name":       g.Name(),

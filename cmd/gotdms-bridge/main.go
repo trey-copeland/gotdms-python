@@ -57,7 +57,9 @@ func usage() {
 serve reads versioned frames on stdin and writes them on stdout.
 Sample columns are Arrow IPC streams in the frame payload, not JSON.
 convert writes manifest.json and data/N.arrow. Samples stay raw unless
---scaled is set and every file of the channel has the same NI linear scale.
+--scaled is set. Ordinary channels need the same NI linear scale on every
+file. DAQmx channels apply a linear or polynomial chain, or return stored
+engineering units when NI_Scaling_Status is "scaled".
 `)
 }
 
@@ -122,7 +124,7 @@ func runConvert(args []string) error {
 	end := fs.String("end", "", "window end RFC3339, exclusive")
 	absolute := fs.Bool("absolute", true, "include absolute time_ns")
 	relative := fs.Bool("relative", true, "include basis-relative relative_s")
-	scaled := fs.Bool("scaled", false, "apply an NI linear scale; error if none exists")
+	scaled := fs.Bool("scaled", false, "apply an NI linear scale, or a DAQmx linear/polynomial chain; error if none exists")
 	out := fs.String("out", "", "output directory")
 	if err := fs.Parse(args); err != nil {
 		return err

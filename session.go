@@ -269,6 +269,9 @@ type channelJSON struct {
 	HasScale     bool           `json:"has_scale"`
 	Scale        *scaleOut      `json:"scale,omitempty"`
 	HasNonlinear bool           `json:"has_nonlinear_scale"`
+	DAQmx        bool           `json:"daqmx,omitempty"`
+	Digital      bool           `json:"digital,omitempty"`
+	DAQmxScale   bool           `json:"daqmx_scale,omitempty"`
 	Properties   map[string]any `json:"properties,omitempty"`
 }
 
@@ -296,6 +299,9 @@ func (s *session) enrich(in []dataset.Occurrence) []channelJSON {
 			c.HasScale = info.hasLinear
 			c.HasNonlinear = info.nonlinear
 			c.Properties = info.properties
+			c.DAQmx = info.daqmx
+			c.Digital = info.digital
+			c.DAQmxScale = info.willScale
 			if info.hasLinear {
 				c.Scale = &scaleOut{Slope: info.slope, Intercept: info.intercept, Index: info.index}
 			}
@@ -364,15 +370,31 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 	if limited && window {
 		return nil, nil, false, errCode("argument", "sample limit and time window are mutually exclusive")
 	}
+	daqmxAt := map[int]struct{}{}
+	for i, sel := range sels {
+		ok, err := s.selectorDAQmx(sel)
+		if err != nil {
+			return nil, nil, limited, err
+		}
+		if ok {
+			daqmxAt[i] = struct{}{}
+		}
+	}
 	var series []dataset.Series
+	var natives []nativeCol
 	var reads []spanRead
-	if limited {
+	switch {
+	case limited && len(daqmxAt) == 0:
 		series, reads, err = s.readLimited(sels, offset, limit, basis)
-	} else {
+	case limited:
+		series, natives, reads, err = s.readIndexed(sels, offset, limit, basis, indexOpts{scale: scaled, native: true})
+	case len(daqmxAt) == 0:
 		series, err = s.loadSeries(sels, start, end, window, ro)
 		if err == nil {
 			reads = s.fullReads(sels)
 		}
+	default:
+		series, natives, reads, err = s.readMixed(sels, daqmxAt, start, end, window, basis, ro, scaled)
 	}
 	if err != nil {
 		return nil, nil, limited, err
@@ -383,7 +405,11 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 		if err != nil {
 			return nil, nil, limited, err
 		}
-		tables[i], err = encodeSeries(ser, cols, info, scaled && info.hasLinear, match)
+		var nat *nativeCol
+		if natives != nil {
+			nat = &natives[i]
+		}
+		tables[i], err = encodeSeries(ser, cols, info, scaled, match, nat)
 		if err != nil {
 			return nil, nil, limited, err
 		}
@@ -538,9 +564,25 @@ func (s *session) scaleFor(ser dataset.Series, scaled bool) (scaleInfo, bool, er
 				return scaleInfo{}, false, errCode("scale_mismatch", "linear scale differs across files of "+ser.Group+"/"+ser.Name)
 			}
 		}
+		if (m.daqmx || info.daqmx) && (m.daqmx != info.daqmx || m.daqmxKey != info.daqmxKey || m.willScale != info.willScale || m.digital != info.digital || m.tdmsType != info.tdmsType) {
+			if scaled {
+				return scaleInfo{}, false, errCode("scale_mismatch", "DAQmx scale differs across files of "+ser.Group+"/"+ser.Name)
+			}
+		}
 	}
 	if !set {
 		return scaleInfo{}, true, nil
+	}
+	if info.daqmx {
+		if scaled {
+			if info.nonlinear {
+				return scaleInfo{}, false, errCode("nonlinear_scale", "channel "+ser.Group+"/"+ser.Name+" has a DAQmx scale this bridge does not apply")
+			}
+			if !info.willScale {
+				return scaleInfo{}, false, errCode("no_scale", "channel "+ser.Group+"/"+ser.Name+" has no DAQmx scale")
+			}
+		}
+		return info, propsMatch, nil
 	}
 	if scaled {
 		if info.nonlinear && !info.hasLinear {
