@@ -24,7 +24,10 @@ except ImportError:
     TdmsFile = None
     TdmsTimestamp = None
 
-from test_write import goban_groups, goban_write
+try:
+    from test_write import goban_groups, goban_write
+except ImportError:  # loaded as python.tests.test_write_nptdms
+    from .test_write import goban_groups, goban_write
 
 
 def _plain(value):
@@ -56,15 +59,15 @@ class NptdmsOracleTest(unittest.TestCase):
         _result, when, frac = goban_write(path)
         expect = goban_groups()
 
-        with TdmsFile.read(path) as tdms:
+        with TdmsFile.read(path, raw_timestamps=True) as tdms:
             self.assertEqual(tdms.tdms_version, 4713)
-            props = {name: _plain(value) for name, value in tdms.properties.items()}
+            props = tdms.properties
             self.assertEqual(props["title"], "cleaned run")
-            self.assertEqual(props["revision"], 4)
-            self.assertIs(props["approved"], False)
-            self.assertEqual(props["gain"], 0.125)
-            self.assertEqual(props["code"], 7)
-            self.assertEqual(props["ratio"], 1.25)
+            self.assertEqual(_plain(props["revision"]), 4)
+            self.assertIs(_plain(props["approved"]), False)
+            self.assertEqual(_plain(props["gain"]), 0.125)
+            self.assertEqual(_plain(props["code"]), 7)
+            self.assertEqual(_plain(props["ratio"]), 1.25)
             self.assertIsInstance(props["when"], TdmsTimestamp)
             self.assertEqual(props["when"].as_datetime(), when.replace(tzinfo=None))
             self.assertIsInstance(props["exact"], TdmsTimestamp)

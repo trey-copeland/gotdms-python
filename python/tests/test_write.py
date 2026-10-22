@@ -51,10 +51,19 @@ class WriteTest(unittest.TestCase):
             [1_717_238_215_123_456_789, 1_717_238_216_000_000_000],
             dtype=pl.Datetime("ns", "UTC"),
         )
-        naive = pl.Series("naive", [datetime(2024, 1, 2, 3, 4, 5, 123456)])
+        naive = pl.Series(
+            "naive",
+            [
+                datetime(2024, 1, 2, 3, 4, 5, 123456),
+                datetime(2024, 1, 2, 3, 4, 6, 1),
+            ],
+        )
         micros = pl.Series(
             "micros",
-            [datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=timezone.utc)],
+            [
+                datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=timezone.utc),
+                datetime(2024, 1, 2, 3, 4, 6, 1, tzinfo=timezone.utc),
+            ],
             dtype=pl.Datetime("us", "UTC"),
         )
         wide = 2**60 + 3
@@ -319,12 +328,12 @@ class WriteTest(unittest.TestCase):
         path = self.path("empty.tdms")
         gotdms.write_tdms(
             path,
-            pl.DataFrame(
-                {
+            {
+                "data": {
                     "empty": pl.Series("empty", [], dtype=pl.Float64),
                     "v": pl.Series("v", [1.0], dtype=pl.Float64),
                 }
-            ),
+            },
         )
         got = gotdms.read_tdms(path)
         empty = got.groups["data"].channels["empty"]
