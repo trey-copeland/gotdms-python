@@ -46,6 +46,12 @@ Both modes return raw samples unless you set `scaled=True` or `--scaled`.
 | `channel.time_track(absolute_time=True)` | `channel.time_track(absolute_time=True)`, `numpy.datetime64[ns]`. |
 | `channel.time_track(absolute_time=False)` | `channel.time_track(absolute_time=False)` is seconds since the basis, not npTDMS's zero-at-first-sample track. See below. |
 | `as_dataframe(time_index=True, absolute_time=..., scaled_data=True)` | `as_polars(time="column", absolute_time=..., align="nptdms", scaled=True)`, or `scan_tdms(..., absolute_time=..., align="nptdms", scaled=True).collect()`. Polars has no row index, so the DatetimeIndex is a `time` column. Default `align` is `"strict"` and default `scaled` is `False`. |
+| `TdmsWriter` and `write_segment` | `gotdms.write_tdms(path, data, ...)`. See [Writing files](#writing-files). |
+| `RootObject(properties=...)` | `properties=` on `write_tdms`. |
+| `GroupObject(name, properties=...)` | A group key in `data`, and `group_properties=`. |
+| `ChannelObject(group, channel, data, properties=...)` | A column of that group's frame, and `channel_properties=`. `unit_string` is a string property. |
+| `TdmsWriter(path, mode="a")` | `write_tdms(..., mode="append")` on a file that already ends on a finished segment. |
+| `read_data(scaled=False)` when you need the stored type | `gotdms.read_tdms(path)`. `Session.read` and `channel.data()` stay float64. |
 | `tdmsinfo` | No CLI inspector. Use `catalog` or the convert manifest. |
 | HDF5 export | Not provided. |
 
@@ -227,9 +233,80 @@ Each `.arrow` file is one Arrow IPC stream with one record batch. The schema met
 
 A data payload is `uint32` count, then for each channel `uint32` byte length and one Arrow IPC stream. The header's `channels` array is in the same order. Empty payloads are metadata replies. Errors are `{"op":"error","code":"...","message":"..."}` and the Python client raises the matching exception. A version other than 1 returns `bad_version` and the process keeps reading.
 
-Requests: `open`, `describe`, `catalog`, `find`, `search`, `match`, `read`, `read_many`, `close`. `open` and `describe` take `paths` or `directory` plus `pattern`, `timestamp_channel`, `timestamp_channels`, `numeric_epoch`, `basis`, `overlap` (`keep_first`, `keep_last`, `error`), `workers`, and `read_workers`. `describe` returns `sample_reads` (0), `files`, `groups`, and `channels`. It does not call `dataset.Open` and does not decode samples. Reads take `absolute` (default true), `relative` (default true), `scaled` (default false), optional `basis`, optional `start` and `end`, and optional `offset` and `limit`.
+Requests: `open`, `describe`, `catalog`, `find`, `search`, `match`, `read`, `read_many`, `close`, `write_begin`, `write_chunk`, `write_end`, `read_values`. `open` and `describe` take `paths` or `directory` plus `pattern`, `timestamp_channel`, `timestamp_channels`, `numeric_epoch`, `basis`, `overlap` (`keep_first`, `keep_last`, `error`), `workers`, and `read_workers`. `describe` returns `sample_reads` (0), `files`, `groups`, and `channels`. It does not call `dataset.Open` and does not decode samples. Reads take `absolute` (default true), `relative` (default true), `scaled` (default false), optional `basis`, optional `start` and `end`, and optional `offset` and `limit`.
+
+`write_begin`, `write_chunk`, and `write_end` are the export. `write_begin` names the path, mode (`create` or `append`), file properties, and groups. `write_chunk` carries one Arrow IPC stream for one channel, column name `y`. `write_end` closes the file. `read_values` is the inverse: native channel values, not the float64 dataset read. A `read` response still uses the counted multi-channel envelope. A `write_chunk` payload is the Arrow stream itself. Protocol version stays 1, so an older client that never sends these ops is unchanged. An older bridge answers `write_begin` with an unknown-op argument error.
 
 `offset` and `limit` select a half-open sample range of the merged series, `[offset, offset+limit)`. Omit both for the full dataset read, which is unchanged. `limit` without `offset` is a prefix. `offset` without `limit` reads through the end. A time window together with a sample range is an error. The response adds `reads` and `limited`. `reads` lists each decoded slice: `file`, `group`, `name`, `role` (`data` or `timestamp`), `offset`, `length`, and `channel_samples`. `limited` is true when a sample range was applied. Clients that do not know these fields ignore them. A Python read that asked for a range and got `limited: false` raises `ProtocolError`, which is how an older bridge that ignored the fields is detected. Protocol version stays 1.
+
+## Writing files
+
+`gotdms.write_tdms` is the `TdmsWriter` path. It does not import npTDMS. A cleaned export is one file with several groups: the samples, an uncertainties group, a design group, and a log group. Groups may have different lengths. A group given as a mapping of `polars.Series` may contain channels of different lengths. A group given as a DataFrame is rectangular.
+
+```python
+import gotdms
+import polars as pl
+
+when = "2024-06-01T12:00:00Z"
+gotdms.write_tdms(
+    "cleaned.tdms",
+    {
+        "data": pl.DataFrame({"voltage": [1.0, 1.5, 1.25, 1.75], "current": [0.1, 0.2, 0.15, 0.25]}),
+        "uncertainties": pl.DataFrame({"voltage": [0.01, 0.02, 0.01], "current": [0.001, 0.002, 0.001]}),
+        "design": {
+            "setpoint": pl.Series("setpoint", [10.0, 20.0]),
+            "label": pl.Series("label", ["low", "mid", "high"]),
+        },
+        "log": pl.DataFrame({"message": ["opened", "cleaned", ""], "level": pl.Series("level", [1, 2, 2], dtype=pl.Int32)}),
+    },
+    properties={"title": "cleaned run", "revision": 4, "approved": False},
+    group_properties={"data": {"role": "samples"}, "log": {"role": "event"}},
+    channel_properties={
+        "data": {"voltage": {"unit_string": "V"}, "current": {"unit_string": "A"}},
+        "uncertainties": {"voltage": {"unit_string": "V"}, "current": {"unit_string": "A"}},
+        "design": {"setpoint": {"unit_string": "V"}},
+    },
+    waveforms={"data": {"voltage": {"wf_start_time": when, "wf_increment": 0.001, "wf_start_offset": 0.0}}},
+)
+contents = gotdms.read_tdms("cleaned.tdms")
+```
+
+npTDMS, the same file:
+
+```python
+from datetime import datetime, timezone
+
+from nptdms import ChannelObject, GroupObject, RootObject, TdmsWriter
+
+when = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
+with TdmsWriter("cleaned.tdms") as writer:
+    writer.write_segment([
+        RootObject(properties={"title": "cleaned run", "revision": 4, "approved": False}),
+        GroupObject("data", properties={"role": "samples"}),
+        ChannelObject("data", "voltage", [1.0, 1.5, 1.25, 1.75], properties={
+            "unit_string": "V",
+            "wf_start_time": when,
+            "wf_increment": 0.001,
+            "wf_start_offset": 0.0,
+            "wf_samples": 4,
+        }),
+        ChannelObject("data", "current", [0.1, 0.2, 0.15, 0.25], properties={"unit_string": "A"}),
+    ])
+```
+
+`write_tdms` writes little-endian segments, version 4713, and does not write a `.tdms_index`. `mode="create"` writes a temporary file beside the destination and renames it into place only after the file reopens. A failed create leaves an existing destination alone. `mode="append"` requires a file whose final segment is complete. It adds a segment at the end. It does not rewrite earlier segments, so a property set on the first write is still there after an append that does not restate it. A channel whose stored type differs from the new column is rejected. An interrupted append can leave an incomplete final segment, and a later append will refuse that file.
+
+Dtypes are Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Boolean, String, and Datetime. Other dtypes raise `ArgumentError`. Values are not coerced. A null in any column, including a string column, is an error. Nulls are not stored as zero or as `""`. An empty string is a real value. A column with no rows is stored without a raw-data index, so `read_tdms` reports type `void` and does not keep the Polars dtype.
+
+Datetime columns are TDMS timestamps and come back as `Datetime(ns, UTC)`. A naive datetime is UTC. An aware datetime is converted to UTC. Milliseconds and microseconds widen to nanoseconds. A property datetime is a Python datetime, so it has microsecond resolution. `{"seconds": int, "fraction": int}` keeps the full 2^-64 fraction. `seconds` is the TDMS count from 1904-01-01 00:00:00 UTC, the same field npTDMS uses, not a Unix timestamp.
+
+Properties are bool, int, float, str, datetime, or `gotdms.Property(value, tdms_type)` when the width matters. A plain int is int32 when it fits and int64 otherwise. Waveform fields are `wf_start_time`, `wf_increment`, `wf_start_offset`, and `wf_samples`. If a waveform dict omits `wf_samples`, it is the column length. Waveform fields belong on numeric channels. The same name cannot be both a waveform field and a channel property.
+
+`read_tdms` returns those stored types. `Session.read`, `channel.data()`, and `as_polars` still return float64 and still reject a string channel. Open the file with `gotdms.open` to catalog it, including a log group, and use `read_tdms` when the log strings or the integer width matter. Integer channels wider than the float64 mantissa are still float64 on that dataset path.
+
+Fixed-size columns, including bool and timestamp, are streamed with `Writer.Stream` in Arrow chunks. String columns cannot be streamed, because the offset table needs every length, so they are buffered and written as a following segment when the file also has fixed-size columns.
+
+npTDMS reads the file this writes. `read_data(scaled=False)` is the raw samples. npTDMS scales by default, and this package does not. CI installs npTDMS only as that oracle. The package does not depend on it.
 
 ## Gaps that remain
 
@@ -241,4 +318,4 @@ Requests: `open`, `describe`, `catalog`, `find`, `search`, `match`, `read`, `rea
 - `Channel.Slice` and `CursorAt` read a sample range without walking earlier samples. Dataset time windows do not use them: a waveform window still starts its cursor at sample 0, and a timestamp axis is decoded in full. `offset` and `limit` on `read` and `read_many` are a bridge range read. They call `Slice` for the merged sample range and do not decode the other samples of the selected channels. A full read, and any `start`/`end` window, still goes through dataset. `describe` does not read samples. `open` still learns each file's span from declared clocks (first two samples when the first step is positive, otherwise the whole clock). That catalog read is not listed in `reads`. A `head` or `limit` on `scan_tdms` does not move `basis`.
 - Eager `read_all` is an explicit call. `open` alone does not pull every sample into Python.
 - File-status for an incomplete final segment is the core reader's behavior; the bridge does not add an npTDMS `file_status` object.
-- Integers wider than the float64 mantissa are returned as `float64`, which is what the dataset layer already does.
+- Integers wider than the float64 mantissa are returned as `float64` from `Session.read`, `channel.data()`, and `as_polars`, which is what the dataset layer already does. `read_tdms` keeps the stored width, including int64 and uint64 past 2^53.

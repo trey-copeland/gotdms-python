@@ -15,5 +15,10 @@
 // describe returns the same catalog fields as open and does not decode
 // channel samples. read and read_many accept an optional sample offset and
 // limit. The response adds reads (the slices that were decoded) and limited.
-// Omitting both fields keeps the full dataset read. Protocol version stays 1.
+// Omitting both fields keeps the full dataset read.
+//
+// write_begin, write_chunk, and write_end add TDMS writing without a new
+// protocol version. read_values returns stored channel values in native
+// Arrow types. Clients that only use the read ops are unchanged. Protocol
+// version stays 1.
 package bridge

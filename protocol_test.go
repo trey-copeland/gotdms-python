@@ -327,6 +327,7 @@ type reply struct {
 	SampleReads int
 	Payload     []byte
 	Closed      bool
+	Header      json.RawMessage
 }
 
 func (c *client) call(t *testing.T, header map[string]any) reply {
@@ -365,6 +366,7 @@ func (c *client) callVersion(t *testing.T, version uint16, header map[string]any
 		Op: raw.Op, Code: raw.Code, Message: raw.Message,
 		Candidates: raw.Candidates, Payload: f.Payload, Closed: raw.Closed,
 		Reads: raw.Reads, Limited: raw.Limited, SampleReads: raw.SampleReads,
+		Header: f.Header,
 	}
 	if len(raw.Channels) > 0 && string(raw.Channels) != "null" {
 		if len(f.Payload) > 0 {

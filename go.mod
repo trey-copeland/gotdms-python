@@ -3,12 +3,12 @@ module github.com/trey-copeland/gotdms-python
 go 1.22.0
 
 // github.com/trey-copeland/gotdms has no release tag. This pseudo-version is
-// gotdms main at 1b2458daaea8bf4f424b88fba93228a302ac05c1, which includes the
-// dataset API this module imports. Switch the requirement to v0.1.0 once
-// that tag exists. See EXTRACTION.md.
+// gotdms main at 9ad35ef91606a11bac250d0fc763f32fab09b6b8, which includes the
+// dataset API and Writer.Stream. Switch the requirement to v0.1.0 once that
+// tag exists. See EXTRACTION.md.
 require (
 	github.com/apache/arrow-go/v18 v18.0.0
-	github.com/trey-copeland/gotdms v0.0.0-20261019014027-1b2458daaea8
+	github.com/trey-copeland/gotdms v0.0.0-20261019115415-9ad35ef91606
 )
 
 require (
