@@ -1,6 +1,6 @@
 # CI for github.com/trey-copeland/gotdms-python.
 # The Go module, pyproject.toml, and python/ tree are at the repository root.
-# github.com/trey-copeland/gotdms is required at the pseudo-version in go.mod.
+# github.com/trey-copeland/gotdms is required at the version in go.mod.
 # There is no replace directive.
 
 name: 'Build and test Go bridge and Python package'

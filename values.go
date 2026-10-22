@@ -11,6 +11,11 @@ import (
 // IPC. This is the inverse of the write ops. It does not go through the
 // dataset layer, which converts numeric channels to float64 and rejects
 // strings, bools, and timestamp channels.
+//
+// Each group is read with Group.Values. That is the one-pass split of a
+// shared interleaved segment. A channel that continues in a later segment
+// is written at its own sample index. Channel.Values would also place
+// those samples, but it reads each channel on its own.
 func readValues(path string) (any, []byte, error) {
 	if path == "" {
 		return nil, nil, errCode("argument", "read_values needs a path")
@@ -23,17 +28,21 @@ func readValues(path string) (any, []byte, error) {
 	groups := make([]map[string]any, 0, len(f.Groups()))
 	var parts [][]byte
 	for _, g := range f.Groups() {
-		chans := make([]map[string]any, 0, len(g.Channels()))
-		for _, ch := range g.Channels() {
+		channels := g.Channels()
+		vals, err := g.Values()
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(vals) != len(channels) {
+			return nil, nil, errCode("argument", fmt.Sprintf("group %s returned %d value sets for %d channels", g.Name(), len(vals), len(channels)))
+		}
+		chans := make([]map[string]any, 0, len(channels))
+		for i, ch := range channels {
 			wire, ok := wireOf(ch.DataType())
 			if !ok {
 				return nil, nil, errCode("argument", fmt.Sprintf("channel %s/%s has unsupported type %s", g.Name(), ch.Name(), ch.DataType()))
 			}
-			vals, err := ch.Values()
-			if err != nil {
-				return nil, nil, err
-			}
-			blob, err := encodeNative(ch.DataType(), vals)
+			blob, err := encodeNative(ch.DataType(), vals[i])
 			if err != nil {
 				return nil, nil, err
 			}

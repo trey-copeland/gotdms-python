@@ -15,7 +15,7 @@ Platform tags used by .github/workflows/build-and-publish-python-package.yml:
 The Go binary is static (CGO_ENABLED=0), so the manylinux tag is a
 platform label rather than a glibc build. Run this from the repository
 root. It does not edit go.mod. The core module is the version required
-there (a gotdms pseudo-version until v0.1.0 is tagged).
+there (gotdms v0.1.1).
 """
 
 from __future__ import annotations

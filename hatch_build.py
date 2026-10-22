@@ -7,8 +7,8 @@ plus GOOS and GOARCH. A source install with those unset tags the wheel for
 the host (linux/amd64 -> manylinux_2_17_x86_64, and the four other pairs
 .github/workflows/build-and-publish-python-package.yml builds). CGO_ENABLED=0.
 
-go.mod requires github.com/trey-copeland/gotdms at a commit pseudo-version
-(v0.1.0 once that core tag exists). ``go build`` downloads that module.
+go.mod requires github.com/trey-copeland/gotdms v0.1.1. ``go build``
+downloads that module.
 This hook does not rewrite go.mod and does not vendor a third_party/gotdms
 tree. That vendoring belonged to the in-tree bridge, whose only core
 requirement was ``replace => ../``.
