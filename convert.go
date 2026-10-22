@@ -179,6 +179,9 @@ func writeBundle(dir string, basis time.Time, tables []table) error {
 	if err != nil {
 		return err
 	}
+	// Properties may contain the non-finite placeholder. The manifest is
+	// JSON that Python reads, so those become NaN and Infinity tokens.
+	b = restoreNonFinite(b)
 	b = append(b, '\n')
 	return os.WriteFile(filepath.Join(dir, "manifest.json"), b, 0o644)
 }

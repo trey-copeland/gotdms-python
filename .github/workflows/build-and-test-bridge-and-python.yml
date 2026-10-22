@@ -101,3 +101,15 @@ jobs:
 
       - name: test
         run: go test ./...
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies
+        # nptdms is LGPL-3.0-only. CI uses it as a reader of files this
+        # package wrote. It is not a runtime dependency and it is not shipped.
+        run: python -m pip install numpy pyarrow polars nptdms
+
+      - name: Python unit tests
+        run: python -m unittest discover -s python/tests

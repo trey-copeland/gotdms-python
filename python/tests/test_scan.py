@@ -25,7 +25,7 @@ class ScanTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.bin = Path(cls.tmp.name) / "gotdms-bridge"
+        cls.bin = Path(cls.tmp.name) / ("gotdms-bridge.exe" if os.name == "nt" else "gotdms-bridge")
         subprocess.check_call(
             ["go", "build", "-o", str(cls.bin), "./cmd/gotdms-bridge"],
             cwd=ROOT,
