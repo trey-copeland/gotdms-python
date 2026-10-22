@@ -8,7 +8,7 @@ Versions are the ones selected by `go.mod` when this file was written. `go list 
 
 | Module | Version | License | File |
 | --- | --- | --- | --- |
-| github.com/trey-copeland/gotdms | v0.0.0-20261019014027-1b2458daaea8 (main 1b2458daaea8bf4f424b88fba93228a302ac05c1; not yet tagged) | MIT | licenses/go/gotdms-core-LICENSE |
+| github.com/trey-copeland/gotdms | v0.0.0-20261019115415-9ad35ef91606 (main 9ad35ef91606a11bac250d0fc763f32fab09b6b8; not yet tagged) | MIT | licenses/go/gotdms-core-LICENSE |
 | github.com/apache/arrow-go/v18 | v18.0.0 | Apache-2.0 | licenses/go/apache-arrow-go-LICENSE.txt |
 | github.com/google/flatbuffers | v24.3.25 | Apache-2.0 | licenses/go/flatbuffers-LICENSE |
 | github.com/goccy/go-json | v0.10.3 | MIT | licenses/go/goccy-go-json-LICENSE |

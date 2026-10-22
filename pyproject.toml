@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gotdms"
 version = "0.1.0"
-description = "MIT Python client for the gotdms TDMS reader. NumPy arrays and Polars frames, with the gotdms-bridge binary bundled in the wheel."
+description = "MIT Python client for the gotdms TDMS reader and writer. NumPy arrays and Polars frames, with the gotdms-bridge binary bundled in the wheel."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY.md", "licenses/go/*"]

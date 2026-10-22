@@ -24,10 +24,22 @@ VERSION = 1
 _PREFIX = struct.Struct("<4sHHII")
 
 
-def write_frame(stream, header: dict) -> None:
+def write_frame(stream, header: dict, payload: bytes | None = None) -> None:
+    """Write one protocol frame. ``payload`` is raw bytes, not JSON.
+
+    Read responses and ``read_values`` use the counted multi-channel
+    envelope inside the payload. ``write_chunk`` puts one Arrow IPC stream
+    in the payload directly.
+    """
     body = json.dumps(header, separators=(",", ":")).encode()
-    stream.write(_PREFIX.pack(MAGIC, VERSION, 0, len(body), 0))
-    stream.write(body)
+    payload = payload or b""
+    if len(payload) > 0xFFFFFFFF:
+        raise ArgumentError("Arrow chunk exceeds the frame payload limit (4 GiB)")
+    stream.write(_PREFIX.pack(MAGIC, VERSION, 0, len(body), len(payload)))
+    if body:
+        stream.write(body)
+    if payload:
+        stream.write(payload)
     stream.flush()
 
 

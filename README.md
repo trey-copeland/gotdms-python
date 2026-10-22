@@ -1,6 +1,6 @@
 # gotdms
 
-Python client for the MIT [gotdms](https://github.com/trey-copeland/gotdms) TDMS reader. Analysis stays in Python. Frames are Polars. Samples are NumPy arrays. The package does not import npTDMS.
+Python client for the MIT [gotdms](https://github.com/trey-copeland/gotdms) TDMS reader and writer. Analysis stays in Python. Frames are Polars. Samples are NumPy arrays. The package does not import npTDMS.
 
 NumPy is BSD-3-Clause. Polars and `polars-runtime-32` are MIT. pyarrow, used to read the Arrow IPC stream, is Apache-2.0. The license inventory is `THIRD_PARTY.md`.
 
@@ -25,6 +25,24 @@ lazy = gotdms.scan_tdms(
 )
 frame = lazy.select("time", "acq/ai0").head(1000).collect()
 ```
+
+```python
+import polars as pl
+import gotdms
+
+gotdms.write_tdms(
+    "cleaned.tdms",
+    {
+        "data": pl.DataFrame({"voltage": [1.0, 1.5, 1.25], "current": [0.1, 0.2, 0.15]}),
+        "log": pl.DataFrame({"message": ["opened", "cleaned"]}),
+    },
+    properties={"title": "cleaned"},
+    channel_properties={"data": {"voltage": {"unit_string": "V"}, "current": {"unit_string": "A"}}},
+)
+native = gotdms.read_tdms("cleaned.tdms")
+```
+
+`write_tdms` takes one Polars frame or a mapping of group name to a frame (or to a mapping of channel name to a Series, when lengths differ). `read_tdms` returns the stored types. `session["group"]["channel"].data()` stays float64 and still rejects a string channel. The [migration note](docs/nptdms-migration.md) maps this to `TdmsWriter`.
 
 `scan_tdms` returns a Polars `LazyFrame`. Calling it reads groups, channels, types, and sample counts. It does not decode channel samples. `select` then `head` or `limit`, with no filter, decodes only those channels and only that prefix (`Channel.Slice` on the bridge). A predicate runs in Python after the read. `slice(offset, length)` is not pushed on Polars 2: the selected columns are read in full and Polars slices the batch. The same timestamp rules as `open` apply, including a caller-supplied `basis` that a row limit does not move. See [`docs/nptdms-migration.md`](docs/nptdms-migration.md).
 
@@ -54,4 +72,4 @@ Python 3.10 or newer. The client and the bridge speak protocol version 1. That p
 
 This repository is [gotdms-python](https://github.com/trey-copeland/gotdms-python). The proposed PyPI distribution name is `gotdms`. The import package is `gotdms`. Nothing has been published to PyPI, and this repository has no release tag. `0.1.0` in `pyproject.toml` is the version recorded for that first release. It is not a tag.
 
-The Go module requires [gotdms](https://github.com/trey-copeland/gotdms) at `v0.0.0-20261019014027-1b2458daaea8`, which is gotdms `main` commit `1b2458daaea8bf4f424b88fba93228a302ac05c1`. That commit has the dataset API this binary imports. gotdms has no release tag yet. When `v0.1.0` is tagged there, this requirement should become `github.com/trey-copeland/gotdms v0.1.0`. There is no `replace` directive. See [`EXTRACTION.md`](EXTRACTION.md).
+The Go module requires [gotdms](https://github.com/trey-copeland/gotdms) at `v0.0.0-20261019115415-9ad35ef91606`, which is gotdms `main` commit `9ad35ef91606a11bac250d0fc763f32fab09b6b8`. That commit has the dataset API and `Writer.Stream`. gotdms has no release tag yet. When `v0.1.0` is tagged there, this requirement should become `github.com/trey-copeland/gotdms v0.1.0`. There is no `replace` directive. See [`EXTRACTION.md`](EXTRACTION.md).

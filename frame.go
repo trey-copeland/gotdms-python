@@ -37,6 +37,10 @@ const MaxHeader = 32 << 20
 //
 // Each stream has one record batch and its own schema metadata. The header
 // JSON lists channels in the same order. Empty responses omit the payload.
+//
+// write_chunk is the exception: its payload is one Arrow IPC stream for a
+// single channel, not the counted envelope. write_begin and write_end carry
+// no payload. read_values uses the counted envelope.
 type Frame struct {
 	Version uint16
 	Flags   uint16

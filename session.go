@@ -15,9 +15,11 @@ import (
 // peer closes the input or sends close. One process holds one dataset.
 func Serve(r io.Reader, w io.Writer) error {
 	s := &session{}
+	defer s.abortWrite()
 	for {
 		f, err := ReadFrame(r)
 		if err != nil {
+			s.abortWrite()
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
@@ -40,10 +42,11 @@ func Serve(r io.Reader, w io.Writer) error {
 		}
 		op := jsonString(req, "op")
 		if op == "close" {
+			s.abortWrite()
 			s.ds = nil
 			return writeResult(w, map[string]any{"op": "result", "closed": true}, nil)
 		}
-		header, payload, err := s.dispatch(op, req)
+		header, payload, err := s.dispatch(op, req, f.Payload)
 		if err != nil {
 			code, msg, cands := classify(err)
 			if err := writeErr(w, code, msg, cands); err != nil {
@@ -65,11 +68,27 @@ type session struct {
 	epoch    time.Time
 	epochSet bool
 	overlap  dataset.OverlapPolicy
+	wr       *fileWrite
 }
 
-func (s *session) dispatch(op string, req map[string]json.RawMessage) (any, []byte, error) {
+func (s *session) dispatch(op string, req map[string]json.RawMessage, payload []byte) (any, []byte, error) {
 	switch op {
+	case "write_begin", "write_chunk", "write_end":
+		header, out, err := s.dispatchWrite(op, req, payload)
+		if err != nil {
+			s.abortWrite()
+			return nil, nil, err
+		}
+		return header, out, nil
+	case "read_values":
+		if s.wr != nil {
+			return nil, nil, errCode("argument", "finish the TDMS write first")
+		}
+		return readValues(jsonString(req, "path"))
 	case "open":
+		if s.wr != nil {
+			return nil, nil, errCode("argument", "finish the TDMS write first")
+		}
 		return s.open(req)
 	case "catalog":
 		return s.catalog()
