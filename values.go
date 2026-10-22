@@ -12,10 +12,13 @@ import (
 // dataset layer, which converts numeric channels to float64 and rejects
 // strings, bools, and timestamp channels.
 //
-// Each group is read with Group.Values. That is the one-pass split of a
-// shared interleaved segment. A channel that continues in a later segment
-// is written at its own sample index. Channel.Values would also place
-// those samples, but it reads each channel on its own.
+// Each channel is read with Channel.Values and encoded before the next one
+// is read, so the bridge holds one channel's decoded values at a time next
+// to the encoded parts. Group.Values would split a shared interleaved
+// segment in one pass, but it holds every channel of the group at once:
+// about a third more peak memory for a few percent of speed. Channel.Values
+// places an interleaved channel that continues in a later segment at its
+// own sample index in gotdms v0.1.0 and v0.1.1.
 func readValues(path string) (any, []byte, error) {
 	if path == "" {
 		return nil, nil, errCode("argument", "read_values needs a path")
@@ -29,20 +32,17 @@ func readValues(path string) (any, []byte, error) {
 	var parts [][]byte
 	for _, g := range f.Groups() {
 		channels := g.Channels()
-		vals, err := g.Values()
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(vals) != len(channels) {
-			return nil, nil, errCode("argument", fmt.Sprintf("group %s returned %d value sets for %d channels", g.Name(), len(vals), len(channels)))
-		}
 		chans := make([]map[string]any, 0, len(channels))
-		for i, ch := range channels {
+		for _, ch := range channels {
 			wire, ok := wireOf(ch.DataType())
 			if !ok {
 				return nil, nil, errCode("argument", fmt.Sprintf("channel %s/%s has unsupported type %s", g.Name(), ch.Name(), ch.DataType()))
 			}
-			blob, err := encodeNative(ch.DataType(), vals[i])
+			vals, err := ch.Values()
+			if err != nil {
+				return nil, nil, err
+			}
+			blob, err := encodeNative(ch.DataType(), vals)
 			if err != nil {
 				return nil, nil, err
 			}

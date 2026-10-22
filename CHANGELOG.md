@@ -4,7 +4,7 @@ Nothing in this repository has been tagged. Nothing has been uploaded to PyPI.
 
 ## Unreleased
 
-- Require `github.com/trey-copeland/gotdms` `v0.1.1` (`7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8`). That tag is `v0.1.0` (`622cb34bacb80fd810d46ee77183e2bae80bf52d`) plus the fix for `ReadValues` and `Group.Values` when an interleaved channel continues in a later segment. `read_tdms` reads each group with `Group.Values`, so those samples stay in order. This package does not build segment-index sidecars. gotdms `v0.1.1` writes those sidecars as version 2, and a reader built with gotdms `v0.1.0` treats a version 2 sidecar as a miss.
+- Require `github.com/trey-copeland/gotdms` `v0.1.1` (`7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8`). That tag is `v0.1.0` (`622cb34bacb80fd810d46ee77183e2bae80bf52d`) plus the fix for `ReadValues` and `Group.Values` when an interleaved channel continues in a later segment. This package was not affected: `read_tdms` reads each channel with `Channel.Values`, and `open`, `read`, and `scan_tdms` read through the dataset layer, which also reads each channel on its own. A regression test now covers interleaved channels that continue in a later segment on all of those paths. This package does not build segment-index sidecars. gotdms `v0.1.1` writes those sidecars as version 2, and a reader built with gotdms `v0.1.0` treats a version 2 sidecar as a miss.
 
 ## 0.1.0 (unreleased)
 

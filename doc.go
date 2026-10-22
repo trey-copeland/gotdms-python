@@ -21,7 +21,7 @@
 //
 // write_begin, write_chunk, and write_end add TDMS writing without a new
 // protocol version. read_values returns stored channel values in native
-// Arrow types. A group is read with Group.Values, so an interleaved
+// Arrow types. Each channel is read on its own, so an interleaved
 // channel that continues in a later segment stays in sample order.
 // Clients that only use the read ops are unchanged. Protocol version
 // stays 1.

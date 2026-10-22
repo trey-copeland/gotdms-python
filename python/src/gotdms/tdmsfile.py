@@ -343,7 +343,7 @@ def read_tdms(path, *, binary=None) -> TdmsContents:
     apply ``NI_Scale`` formulas; pass ``scaled=True`` to :meth:`Session.read`
     or :func:`gotdms.scan_tdms` for a DAQmx linear or polynomial chain.
 
-    Each group is read in one pass. An interleaved channel that continues
+    Each channel is read on its own. An interleaved channel that continues
     in a later segment keeps its samples in order.
 
     File, group, and channel properties are on ``properties`` as Python
