@@ -179,8 +179,10 @@ class Session:
         clocks need ``numeric_epoch``; there is no default epoch. ``basis``
         is the relative-time origin. It is not moved to the first sample.
 
-        gotdms has no DAQmx channel objects. A DAQmx raw channel is ordinary
-        metadata with its stored data type, not a scaled DAQmx waveform.
+        A DAQmx channel is cataloged as its primary scaler. ``data_type`` is
+        that stored type. Digital lines are ``tdsTypeU8``. ``daqmx`` is true
+        on those catalog rows. Samples stay raw until a read passes
+        ``scaled=True``.
         """
         header = _dataset_header(
             "open",
@@ -319,12 +321,24 @@ class Session:
         an error.
 
         ``scaled`` defaults to False. gotdms returns raw samples. Set it only
-        when you want the NI linear scale applied (``raw * slope + intercept``).
-        There is no silent scale. npTDMS returns scaled data unless you pass
-        ``scaled=False`` or read ``raw_data``. A missing linear scale raises
+        when you want a scale applied. There is no silent scale. npTDMS
+        returns scaled data unless you pass ``scaled=False`` or read
+        ``raw_data``.
+
+        An ordinary channel applies an NI linear scale
+        (``raw * slope + intercept``). A missing linear scale raises
         :class:`NoScaleError`. A non-linear scale raises
-        :class:`NonlinearScaleError` and is not applied. DAQmx scales are not
-        applied.
+        :class:`NonlinearScaleError` and is not applied.
+
+        A DAQmx channel stays in the primary scaler's stored type when
+        ``scaled`` is false. Digital lines are ``uint8`` 0 and 1. ``scaled=True``
+        applies the DAQmx linear or polynomial chain and returns ``float64``.
+        ``NI_Scaling_Status`` of ``scaled`` means the stored samples are
+        already engineering units, so the same flag returns those raw values
+        as ``float64``. No DAQmx scale raises :class:`NoScaleError`. A scale
+        type other than linear or polynomial raises
+        :class:`NonlinearScaleError`. The column is the primary scaler.
+        Other scalers on the same channel are not extra columns.
         """
         series, _header = self.read_channels(
             channels,
@@ -576,6 +590,20 @@ class Channel:
         return self.occurrences[0].get("data_type")
 
     @property
+    def daqmx(self) -> bool:
+        """True when the stored samples are DAQmx raw data.
+
+        The column is the primary scaler. ``data_type`` is that scaler's
+        type. Digital lines also set :attr:`digital`.
+        """
+        return any(item.get("daqmx") for item in self.occurrences)
+
+    @property
+    def digital(self) -> bool:
+        """True when the primary DAQmx scaler is a digital line of 0 and 1."""
+        return any(item.get("digital") for item in self.occurrences)
+
+    @property
     def unit(self):
         return self.occurrences[0].get("unit") or ""
 
@@ -601,7 +629,13 @@ class Channel:
         return any(item.get("is_timestamp") for item in self.occurrences)
 
     def data(self, **kwargs):
-        """Raw samples as ``float64``, or linear-scaled samples if ``scaled=True``."""
+        """Samples from :meth:`Session.read`.
+
+        Ordinary channels are ``float64``, or linear-scaled ``float64`` when
+        ``scaled=True``. A DAQmx channel is the stored scaler type. Digital
+        lines are ``uint8`` 0 and 1. ``scaled=True`` on a DAQmx channel is
+        ``float64`` engineering units.
+        """
         return self.session.read(self.name, self.group, **kwargs).y
 
     def time_track(self, absolute_time: bool = True, **kwargs):

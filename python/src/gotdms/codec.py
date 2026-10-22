@@ -113,7 +113,8 @@ class Series:
         ``time_track(absolute_time=False)``, which is ``wf_start_offset`` plus
         the sample index times ``wf_increment`` and is zero at the first
         sample when the offset is zero. An untimed series returns sample
-        indexes. gotdms does not build a DAQmx time track.
+        indexes. A DAQmx channel uses the same waveform or timestamp axis as
+        any other channel. There is no separate DAQmx time track.
         """
         if absolute_time:
             if self.time_ns is None:
@@ -126,6 +127,7 @@ class Series:
 
 def decode_ipc(blob: bytes):
     try:
+        import pyarrow as pa
         import pyarrow.ipc as ipc
     except ImportError as exc:
         raise GotdmsError(
@@ -134,7 +136,13 @@ def decode_ipc(blob: bytes):
     reader = ipc.open_stream(io.BytesIO(blob))
     table = reader.read_all()
     names = set(table.column_names)
-    y = np.asarray(table.column("y").to_numpy(zero_copy_only=False), dtype=np.float64)
+    y_col = table.column("y")
+    # DAQmx columns keep the scaler's stored type. Digital lines are uint8.
+    # Ordinary dataset reads are float64. A timestamp scaler is UTC nanoseconds.
+    if pa.types.is_timestamp(y_col.type):
+        y = np.asarray(y_col.to_numpy(zero_copy_only=False), dtype="datetime64[ns]")
+    else:
+        y = np.asarray(y_col.to_numpy(zero_copy_only=False))
     time_ns = None
     if "time_ns" in names:
         time_ns = np.asarray(table.column("time_ns").to_numpy(zero_copy_only=False), dtype=np.int64)
@@ -210,7 +218,7 @@ def as_polars(series: list[Series], *, time: str = "column", absolute_time: bool
                 raise AlignmentError(
                     "channels do not share a time vector; pass align='nptdms' for a full join"
                 )
-        frame = pl.DataFrame({names[i]: np.asarray(series[i].y, dtype=np.float64) for i in range(len(series))})
+        frame = pl.DataFrame([_value_series(names[i], series[i].y) for i in range(len(series))])
         if time == "none":
             return frame
         return frame.insert_column(0, _time_series(keys[0], key_name, absolute_time))
@@ -222,7 +230,7 @@ def as_polars(series: list[Series], *, time: str = "column", absolute_time: bool
             pl.DataFrame(
                 [
                     _time_series(key, key_name, absolute_time),
-                    pl.Series(name, np.asarray(item.y, dtype=np.float64)),
+                    _value_series(name, item.y),
                 ]
             )
         )
@@ -233,6 +241,21 @@ def as_polars(series: list[Series], *, time: str = "column", absolute_time: bool
     if time == "none":
         return merged.drop(key_name)
     return merged
+
+
+def _value_series(name, values):
+    """Polars series for one channel. The numpy dtype is kept.
+
+    Dataset reads of ordinary channels are float64. DAQmx reads are the
+    stored scaler type, and digital lines are uint8. ``scaled=True`` is
+    float64 because the scale result is engineering units.
+    """
+    import polars as pl
+
+    arr = np.asarray(values)
+    if np.issubdtype(arr.dtype, np.datetime64):
+        return pl.Series(name, arr).cast(pl.Datetime("ns", "UTC"))
+    return pl.Series(name, arr)
 
 
 def _time_series(values, name: str, absolute: bool):

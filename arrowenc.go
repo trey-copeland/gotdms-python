@@ -11,6 +11,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/trey-copeland/gotdms"
 	"github.com/trey-copeland/gotdms/dataset"
 )
 
@@ -34,6 +35,9 @@ type channelOut struct {
 	HasScale        bool           `json:"has_scale"`
 	Scale           *scaleOut      `json:"scale,omitempty"`
 	HasNonlinear    bool           `json:"has_nonlinear_scale"`
+	DAQmx           bool           `json:"daqmx,omitempty"`
+	Digital         bool           `json:"digital,omitempty"`
+	DAQmxScale      bool           `json:"daqmx_scale,omitempty"`
 	Unit            string         `json:"unit,omitempty"`
 	DataType        string         `json:"data_type,omitempty"`
 	Properties      map[string]any `json:"properties,omitempty"`
@@ -58,9 +62,28 @@ type table struct {
 	ipc  []byte
 }
 
-func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, scaled, propsMatch bool) (table, error) {
+func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, requestScaled, propsMatch bool, nat *nativeCol) (table, error) {
+	applyLinear := requestScaled && info.hasLinear && !info.daqmx
+	metaScaled := applyLinear || (requestScaled && info.daqmx && info.willScale)
+	useNative := info.daqmx && !metaScaled
+	yType := arrow.DataType(arrow.PrimitiveTypes.Float64)
+	if useNative {
+		if nat == nil || !nat.set {
+			return table{}, errCode("error", "missing DAQmx values for "+s.Group+"/"+s.Name)
+		}
+		if nat.dt != info.tdmsType && info.tdmsType != 0 {
+			return table{}, errCode("error", "DAQmx type changed for "+s.Group+"/"+s.Name)
+		}
+		if nativeLen(nat.vals) != len(s.Y) {
+			return table{}, errCode("error", fmt.Sprintf("DAQmx %s/%s has %d native values and %d samples", s.Group, s.Name, nativeLen(nat.vals), len(s.Y)))
+		}
+		yType = arrowOf(nat.dt)
+		if yType == nil {
+			return table{}, errCode("argument", "cannot read "+nat.dt.String()+" as a Polars column")
+		}
+	}
 	fields := []arrow.Field{{
-		Name: "y", Type: arrow.PrimitiveTypes.Float64, Nullable: false,
+		Name: "y", Type: yType, Nullable: false,
 	}}
 	columns := []string{"y"}
 	abs := cols.absolute && s.Timed && len(s.Times) == len(s.Y)
@@ -82,9 +105,12 @@ func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, scaled, prop
 		Dt:              s.Dt,
 		Files:           append([]string(nil), s.Files...),
 		Columns:         columns,
-		Scaled:          scaled,
+		Scaled:          metaScaled,
 		HasScale:        info.hasLinear,
 		HasNonlinear:    info.nonlinear,
+		DAQmx:           info.daqmx,
+		Digital:         info.digital,
+		DAQmxScale:      info.willScale,
 		Unit:            info.unit,
 		DataType:        info.dataType,
 		Properties:      info.properties,
@@ -108,15 +134,21 @@ func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, scaled, prop
 	pool := memory.NewGoAllocator()
 	b := array.NewRecordBuilder(pool, schema)
 	defer b.Release()
-	yb := b.Field(0).(*array.Float64Builder)
-	if scaled {
-		vals := make([]float64, len(s.Y))
-		for i, v := range s.Y {
-			vals[i] = v*info.slope + info.intercept
+	if useNative {
+		if err := writeNative(b.Field(0), nat.dt, nat.vals); err != nil {
+			return table{}, err
 		}
-		yb.AppendValues(vals, nil)
-	} else if len(s.Y) > 0 {
-		yb.AppendValues(s.Y, nil)
+	} else {
+		yb := b.Field(0).(*array.Float64Builder)
+		if applyLinear {
+			vals := make([]float64, len(s.Y))
+			for i, v := range s.Y {
+				vals[i] = v*info.slope + info.intercept
+			}
+			yb.AppendValues(vals, nil)
+		} else if len(s.Y) > 0 {
+			yb.AppendValues(s.Y, nil)
+		}
 	}
 	next := 1
 	if abs {
@@ -150,6 +182,116 @@ func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, scaled, prop
 	return table{meta: meta, ipc: buf.Bytes()}, nil
 }
 
+func arrowOf(dt tdms.DataType) arrow.DataType {
+	switch dt {
+	case tdms.TypeInt8:
+		return arrow.PrimitiveTypes.Int8
+	case tdms.TypeInt16:
+		return arrow.PrimitiveTypes.Int16
+	case tdms.TypeInt32:
+		return arrow.PrimitiveTypes.Int32
+	case tdms.TypeInt64:
+		return arrow.PrimitiveTypes.Int64
+	case tdms.TypeUint8:
+		return arrow.PrimitiveTypes.Uint8
+	case tdms.TypeUint16:
+		return arrow.PrimitiveTypes.Uint16
+	case tdms.TypeUint32:
+		return arrow.PrimitiveTypes.Uint32
+	case tdms.TypeUint64:
+		return arrow.PrimitiveTypes.Uint64
+	case tdms.TypeFloat32:
+		return arrow.PrimitiveTypes.Float32
+	case tdms.TypeFloat64:
+		return arrow.PrimitiveTypes.Float64
+	case tdms.TypeTimestamp:
+		return &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}
+	default:
+		return nil
+	}
+}
+
+func writeNative(b array.Builder, dt tdms.DataType, vals any) error {
+	switch dt {
+	case tdms.TypeInt8:
+		s, ok := vals.([]int8)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("int8 values have Go type %T", vals))
+		}
+		b.(*array.Int8Builder).AppendValues(s, nil)
+	case tdms.TypeInt16:
+		s, ok := vals.([]int16)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("int16 values have Go type %T", vals))
+		}
+		b.(*array.Int16Builder).AppendValues(s, nil)
+	case tdms.TypeInt32:
+		s, ok := vals.([]int32)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("int32 values have Go type %T", vals))
+		}
+		b.(*array.Int32Builder).AppendValues(s, nil)
+	case tdms.TypeInt64:
+		s, ok := vals.([]int64)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("int64 values have Go type %T", vals))
+		}
+		b.(*array.Int64Builder).AppendValues(s, nil)
+	case tdms.TypeUint8:
+		s, ok := vals.([]uint8)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("uint8 values have Go type %T", vals))
+		}
+		b.(*array.Uint8Builder).AppendValues(s, nil)
+	case tdms.TypeUint16:
+		s, ok := vals.([]uint16)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("uint16 values have Go type %T", vals))
+		}
+		b.(*array.Uint16Builder).AppendValues(s, nil)
+	case tdms.TypeUint32:
+		s, ok := vals.([]uint32)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("uint32 values have Go type %T", vals))
+		}
+		b.(*array.Uint32Builder).AppendValues(s, nil)
+	case tdms.TypeUint64:
+		s, ok := vals.([]uint64)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("uint64 values have Go type %T", vals))
+		}
+		b.(*array.Uint64Builder).AppendValues(s, nil)
+	case tdms.TypeFloat32:
+		s, ok := vals.([]float32)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("float32 values have Go type %T", vals))
+		}
+		b.(*array.Float32Builder).AppendValues(s, nil)
+	case tdms.TypeFloat64:
+		s, ok := vals.([]float64)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("float64 values have Go type %T", vals))
+		}
+		b.(*array.Float64Builder).AppendValues(s, nil)
+	case tdms.TypeTimestamp:
+		s, ok := vals.([]tdms.Timestamp)
+		if !ok {
+			return errCode("argument", fmt.Sprintf("timestamp values have Go type %T", vals))
+		}
+		tb := b.(*array.TimestampBuilder)
+		for _, ts := range s {
+			t, ok := ts.Time()
+			if !ok {
+				return errCode("argument", "timestamp does not fit in UTC nanoseconds")
+			}
+			tb.Append(arrow.Timestamp(t.UnixNano()))
+		}
+	default:
+		return errCode("argument", fmt.Sprintf("cannot read %s as a Polars column", dt))
+	}
+	return nil
+}
+
 func schemaMeta(m channelOut) arrow.Metadata {
 	props, _ := json.Marshal(m.Properties)
 	props = restoreNonFinite(props)
@@ -169,6 +311,10 @@ func schemaMeta(m channelOut) arrow.Metadata {
 		strconv.FormatBool(m.Scaled), strconv.FormatBool(m.HasScale), strconv.FormatBool(m.HasNonlinear),
 		m.Unit, string(files), string(props), string(gaps),
 		strconv.Itoa(m.Samples),
+	}
+	if m.DAQmx {
+		keys = append(keys, "gotdms.daqmx", "gotdms.digital")
+		vals = append(vals, "true", strconv.FormatBool(m.Digital))
 	}
 	if m.Scale != nil {
 		keys = append(keys, "gotdms.scale_slope", "gotdms.scale_intercept", "gotdms.scale_index")

@@ -332,11 +332,16 @@ def read_tdms(path, *, binary=None) -> TdmsContents:
     Numeric channels stay in their stored width. Strings stay strings.
     Timestamps are ``Datetime(ns, UTC)``. This is not :func:`gotdms.open`:
     samples are not scaled, files are not merged, and a string channel is
-    not converted to float64. ``Session.read`` still returns float64 and
-    rejects non-numeric channels.
+    not converted to float64. ``Session.read`` returns float64 for an
+    ordinary numeric channel. A DAQmx channel is the primary scaler's stored
+    type on both paths. Digital lines are ``UInt8`` 0 and 1.
 
     A channel with no raw-data index has type ``"void"`` and an empty Null
-    series. Extended, complex, and DAQmx channels raise :class:`GotdmsError`.
+    series. Extended and complex channels raise :class:`GotdmsError`.
+    DAQmx raw indexes are read. The column is the primary scaler. Other
+    scalers on that channel are not extra columns. This function does not
+    apply ``NI_Scale`` formulas; pass ``scaled=True`` to :meth:`Session.read`
+    or :func:`gotdms.scan_tdms` for a DAQmx linear or polynomial chain.
 
     File, group, and channel properties are on ``properties`` as Python
     values. Timestamp properties there are timezone-aware datetimes, which
