@@ -44,7 +44,7 @@ This repository does not do that.
 
 ## CI
 
-`.github/workflows/build-and-test-bridge-and-python.yml` runs on push to `main` and on pull requests. Ubuntu tests Go 1.22 and 1.27 (`gofmt`, `go vet`, `go build ./...`, `go test ./...`). Go 1.22 also runs `go test -race ./...` and `python -m unittest discover -s python/tests`. Windows runs `go build ./...` and `go test ./...` on Go 1.22. `.github/workflows/build-and-verify-python-packages.yml` builds an sdist and a linux/amd64 wheel on the same events.
+`.github/workflows/build-and-test-bridge-and-python.yml` runs on push to `main` and on pull requests. Ubuntu tests Go 1.22 and 1.27 (`gofmt`, `go vet`, `go build ./...`, `go test ./...`). Go 1.22 also runs `go test -race ./...` and `python -m unittest discover -s python/tests`. Windows runs `go build ./...`, `go test ./...`, and the Python tests on Go 1.22. A separate job, `Test at minimum supported versions (Python 3.10, numpy 1.26, pyarrow 14, polars 2.0)`, runs the Python tests with Python 3.10, numpy 1.26.0, pyarrow 14.0.0, and polars 2.0.0, the floors in `pyproject.toml`. Every job that installs npTDMS pins `nptdms==1.13.0`. `.github/workflows/build-and-verify-python-packages.yml` builds an sdist and a linux/amd64 wheel on the same events.
 
 ## Versions
 
