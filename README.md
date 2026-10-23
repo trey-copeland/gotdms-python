@@ -4,7 +4,7 @@ Python client for the MIT [gotdms](https://github.com/trey-copeland/gotdms) TDMS
 
 NumPy is BSD-3-Clause. Polars and `polars-runtime-32` are MIT. pyarrow, used to read the Arrow IPC stream, is Apache-2.0. The license inventory is `THIRD_PARTY.md`.
 
-The package is not on PyPI yet; publishing it as `gotdms` is planned, so `pip install gotdms` does not work today. Install it from a checkout of this repository:
+The package is not on PyPI yet (`gotdms` is the proposed distribution name), so `pip install gotdms` does not work today. Install it from a checkout of this repository:
 
 ```bash
 pip install .
@@ -12,7 +12,7 @@ pip install .
 
 That builds a wheel for the machine it runs on and compiles the `gotdms-bridge` binary into it (`CGO_ENABLED=0`, Go 1.22 or newer on `PATH`, network access to the Go module proxy). The source tree does not vendor gotdms.
 
-A wheel bundles the `gotdms-bridge` binary for one platform. `locate_binary` checks an explicit path, then the `GOTDMS_BRIDGE` environment variable, then that bundled file. If none of those exist it raises `GotdmsError`, and the message says to build the binary with Go and point `GOTDMS_BRIDGE` at it. (The message also suggests `pip install gotdms`, which only works once the package is published.) It does not search `PATH`.
+A wheel bundles the `gotdms-bridge` binary for one platform. `locate_binary` checks an explicit path, then the `GOTDMS_BRIDGE` environment variable, then that bundled file. If none of those exist it raises `GotdmsError`, and the message says to run `pip install .` in a checkout, or to build the binary with Go and point `GOTDMS_BRIDGE` at it. It does not search `PATH`.
 
 ```python
 import gotdms
