@@ -77,7 +77,9 @@ class BridgeTest(unittest.TestCase):
             dest.unlink()
             with self.assertRaises(gotdms.GotdmsError) as raised:
                 gotdms.locate_binary()
-            self.assertIn("pip install gotdms", str(raised.exception))
+            self.assertIn("pip install .", str(raised.exception))
+            self.assertIn("GOTDMS_BRIDGE", str(raised.exception))
+            self.assertNotIn("pip install gotdms", str(raised.exception))
         finally:
             os.environ["GOTDMS_BRIDGE"] = saved
             if dest.exists():

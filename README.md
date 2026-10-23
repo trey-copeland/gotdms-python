@@ -4,7 +4,15 @@ Python client for the MIT [gotdms](https://github.com/trey-copeland/gotdms) TDMS
 
 NumPy is BSD-3-Clause. Polars and `polars-runtime-32` are MIT. pyarrow, used to read the Arrow IPC stream, is Apache-2.0. The license inventory is `THIRD_PARTY.md`.
 
-Wheels bundle the `gotdms-bridge` binary for one platform. `locate_binary` checks an explicit path, then the `GOTDMS_BRIDGE` environment variable, then that bundled file. If none of those exist it raises `GotdmsError` and tells you to `pip install gotdms` or to build the binary with Go. It does not search `PATH`. Installing the source distribution compiles the binary (`CGO_ENABLED=0`, Go on `PATH`, network access to the module proxy) and tags the wheel for the machine it is building on. The sdist does not vendor gotdms.
+The package is not on PyPI yet (`gotdms` is the proposed distribution name), so `pip install gotdms` does not work today. Install it from a checkout of this repository:
+
+```bash
+pip install .
+```
+
+That builds a wheel for the machine it runs on and compiles the `gotdms-bridge` binary into it (`CGO_ENABLED=0`, Go 1.22 or newer on `PATH`, network access to the Go module proxy). The source tree does not vendor gotdms.
+
+A wheel bundles the `gotdms-bridge` binary for one platform. `locate_binary` checks an explicit path, then the `GOTDMS_BRIDGE` environment variable, then that bundled file. If none of those exist it raises `GotdmsError`, and the message says to run `pip install .` in a checkout, or to build the binary with Go and point `GOTDMS_BRIDGE` at it. It does not search `PATH`.
 
 ```python
 import gotdms
@@ -16,7 +24,7 @@ with gotdms.open(
 ) as session:
     values = session["acq"]["ai0"].data()  # raw float64
     times = session["acq"]["ai0"].time_track(absolute_time=True)
-    frame = session.as_polars(time="column", align="strict")
+    frame = session["acq"].as_polars(time="column", align="strict")
 
 lazy = gotdms.scan_tdms(
     "run/*.tdms",
@@ -52,19 +60,24 @@ Polars has no row index. npTDMS `as_dataframe(time_index=True)` is the `time` co
 
 A pandas object, if you still want one, is `frame.to_pandas()` on the Polars result. This package does not depend on pandas.
 
-Batch conversion, from the bundled binary or from `GOTDMS_BRIDGE`:
+Batch conversion, from the bundled binary or from `GOTDMS_BRIDGE`. Installing the package does not put `gotdms-bridge` on `PATH`; `python -c 'import gotdms; print(gotdms.locate_binary())'` prints the path the client uses.
 
 ```bash
 gotdms-bridge convert \
   --dir run --timestamp-channel Time \
   --numeric-epoch 2024-03-01T00:00:00Z \
+  --channel acq/ai0 --channel acq/ai1 \
   --out bundle
 ```
 
 ```python
+import gotdms
+
 bundle = gotdms.load_bundle("bundle")
 frame = bundle.as_polars()
 ```
+
+`as_polars` defaults to `align="strict"`, so the selected channels must share one time vector. Channels on different clocks raise `AlignmentError`; select channels that share one, or pass `align="nptdms"` for a full join.
 
 The long npTDMS mapping, including the LGPL-3.0 and MIT license note, is [`docs/nptdms-migration.md`](docs/nptdms-migration.md). This project's own license is MIT (`LICENSE`).
 
@@ -73,3 +86,5 @@ Python 3.10 or newer. The client and the bridge speak protocol version 2. That p
 This repository is [gotdms-python](https://github.com/trey-copeland/gotdms-python). The proposed PyPI distribution name is `gotdms`. The import package is `gotdms`. Nothing has been published to PyPI, and this repository has no release tag. `0.1.0` in `pyproject.toml` is the version recorded for that first release. It is not a tag.
 
 The Go module requires [gotdms](https://github.com/trey-copeland/gotdms) `v0.2.0` (`290bb791b00ad56edeee814960062107d0600cc8`). That is the first core tag with `dataset.WithSharedClock` and `dataset.WithoutTimes`, which protocol 2 reads with. There is no `replace` directive. See [`EXTRACTION.md`](EXTRACTION.md).
+
+Contributing: see [`CONTRIBUTING.md`](CONTRIBUTING.md).

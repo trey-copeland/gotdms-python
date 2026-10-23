@@ -95,7 +95,7 @@ with gotdms.open(
     scaled = session["acq"]["ai1"].data(scaled=True)  # linear scale only
     times = session["acq"]["ai0"].time_track(absolute_time=True)
     relative = session["acq"]["ai0"].time_track(absolute_time=False)
-    frame = session.as_polars(time="column", absolute_time=True, align="strict")
+    frame = session["acq"].as_polars(time="column", absolute_time=True, align="strict")
     window = session.read_many(
         [{"name": "ai0", "group": "acq"}, {"name": "ai1", "group": "acq"}],
         start="2024-03-01T00:00:02Z",
@@ -124,6 +124,8 @@ On Polars 2, `select` without a predicate pushes projection: the bridge decodes 
 Catalog, the `read_metadata` equivalent:
 
 ```python
+import gotdms
+
 with gotdms.open(["a.tdms"], timestamp_channel="Time", numeric_epoch="2024-03-01T00:00:00Z") as session:
     names = [channel.name for channel in session["acq"]]
     catalog = session.catalog()
@@ -337,7 +339,7 @@ npTDMS reads the file this writes. `read_data(scaled=False)` is the raw samples.
 - No HDF5 export.
 - No `tdmsinfo` CLI.
 - Memory mapping is intentionally absent.
-- `Channel.Slice` and `CursorAt` read a sample range without walking earlier samples. Dataset time windows do not use them: a waveform window still starts its cursor at sample 0, and a timestamp axis is decoded in full. `offset` and `limit` on `read` and `read_many` are a bridge range read. They call `Slice` for the merged sample range and do not decode the other samples of the selected channels. A full read of an ordinary channel, and any `start`/`end` window on one, still goes through dataset. A DAQmx read uses the same index path for a full span, a sample range, and a time window, and the Arrow column keeps the scaler type. `describe` does not read samples. `open` still learns each file's span from declared clocks (first two samples when the first step is positive, otherwise the whole clock). That catalog read is not listed in `reads`. A `head` or `limit` on `scan_tdms` does not move `basis`.
+- `Channel.Slice` and `CursorAt` read a sample range without walking earlier samples. Dataset time windows use them (gotdms `v0.2.0`): a waveform window, or a window on a declared clock whose catalog step is positive, reads only that sample range. A declared clock that does not match that step is still decoded in full. `offset` and `limit` on `read` and `read_many` are a bridge range read. They call `Slice` for the merged sample range and do not decode the other samples of the selected channels. A full read of an ordinary channel, and any `start`/`end` window on one, still goes through dataset. A DAQmx read uses the same index path for a full span, a sample range, and a time window, and the Arrow column keeps the scaler type. `describe` does not read samples. `open` still learns each file's span from declared clocks (first two samples when the first step is positive, otherwise the whole clock). That catalog read is not listed in `reads`. A `head` or `limit` on `scan_tdms` does not move `basis`.
 - Eager `read_all` is an explicit call. `open` alone does not pull every sample into Python.
 - File-status for an incomplete final segment is the core reader's behavior; the bridge does not add an npTDMS `file_status` object.
 - Ordinary integers wider than the float64 mantissa are returned as `float64` from `Session.read`, `channel.data()`, and `as_polars`, which is what the dataset layer already does. `read_tdms` keeps the stored width, including int64 and uint64 past 2^53. A DAQmx scaler keeps that width on `read` and `scan_tdms` as well.
