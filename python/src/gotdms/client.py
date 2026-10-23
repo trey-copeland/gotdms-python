@@ -182,7 +182,7 @@ class Session:
             workers=workers,
             read_workers=read_workers,
         )
-        self._catalog = self._rpc(header)
+        self._catalog = _expand_catalog(self._rpc(header))
         return self._catalog
 
     def describe(
@@ -228,7 +228,7 @@ class Session:
 
     def catalog(self):
         """Return groups, channels, and properties. Does not decode samples."""
-        self._catalog = self._rpc({"op": "catalog"})
+        self._catalog = _expand_catalog(self._rpc({"op": "catalog"}))
         return self._catalog
 
     def find(self, name: str):
@@ -416,6 +416,7 @@ class Session:
                 "gotdms-bridge ignored the sample range. Rebuild gotdms-bridge; "
                 "protocol 2 range reads are required."
             )
+        _resolve_read_header(header_out, self._catalog)
         series = series_from_reply(header_out, reply.streams)
         if relative and absolute:
             for item in series:
@@ -714,6 +715,92 @@ def open(paths=None, *, binary=None, **kwargs) -> Session:
         session.close()
         raise
     return session
+
+
+def _index(i, n: int, what: str) -> int:
+    if type(i) is not int or not 0 <= i < n:
+        raise ProtocolError(f"{what} index {i!r} is out of range")
+    return i
+
+
+def _copy_props(props: dict) -> dict:
+    # A timestamp property is a dict; copy it so no two channels, and no
+    # catalog row and Series, share a mutable value.
+    return {k: (dict(v) if type(v) is dict else v) for k, v in props.items()}
+
+
+def _expand_catalog(cat: dict) -> dict:
+    """Expand the bridge's compact catalog to one path string and one
+    properties dict per row, the shape ``open`` and ``catalog`` return.
+
+    On the wire, ``groups[].file`` and ``channels[].file`` index ``files``,
+    and ``channels[].properties`` lists indexes into ``property_table``,
+    which holds each distinct ``{"name", "value"}`` pair once.
+    """
+    try:
+        files = cat["files"]
+        table = cat.pop("property_table")
+        paths = [f["path"] for f in files]
+        pairs = [(e["name"], e["value"]) for e in table]
+        nf, np_ = len(paths), len(pairs)
+        for g in cat["groups"]:
+            g["file"] = paths[_index(g["file"], nf, "group file")]
+        for c in cat["channels"]:
+            c["file"] = paths[_index(c["file"], nf, "channel file")]
+            ids = c.get("properties")
+            if ids is None:
+                continue
+            props = {}
+            for i in ids:
+                if type(i) is not int or not 0 <= i < np_:
+                    _index(i, np_, "property")
+                k, v = pairs[i]
+                props[k] = dict(v) if type(v) is dict else v
+            c["properties"] = props
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ProtocolError(f"malformed catalog: {exc!r}") from None
+    return cat
+
+
+def _resolve_read_header(header: dict, catalog) -> None:
+    """Point a read header's catalog references back at paths and
+    properties, so ``Series.meta`` and ``reads`` look as they always did.
+
+    A read header's channel ``files`` index the catalog's ``files``, and
+    ``properties`` is the index of the catalog channel whose properties
+    apply. ``reads[].file`` indexes ``files`` too.
+    """
+    if catalog is None:
+        raise ProtocolError("read reply before a catalog; open a dataset first")
+    try:
+        paths = [f["path"] for f in catalog["files"]]
+        rows = catalog["channels"]
+        nf, nr = len(paths), len(rows)
+        for m in header["channels"]:
+            fl = m.get("files")
+            if fl is not None:
+                m["files"] = [paths[_index(i, nf, "read file")] for i in fl]
+            at = m.get("properties")
+            if at is None:
+                m.pop("properties", None)
+                continue
+            row = rows[_index(at, nr, "properties")]
+            if row["name"] != m["name"] or row["group"] != m["group"] or (m.get("files") and row["file"] not in m["files"]):
+                raise ProtocolError(
+                    f"read header properties for {m['group']}/{m['name']} point at "
+                    f"{row['group']}/{row['name']} in {row['file']}, not a file of this read"
+                )
+            props = row.get("properties")
+            # Replace in place so the key keeps its position; an empty
+            # dict was omitted before, so drop the key then.
+            if props:
+                m["properties"] = _copy_props(props)
+            else:
+                del m["properties"]
+        for r in header.get("reads") or ():
+            r["file"] = paths[_index(r["file"], nf, "read file")]
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ProtocolError(f"malformed read header: {exc!r}") from None
 
 
 def _dataset_header(

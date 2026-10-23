@@ -17,30 +17,45 @@ type columnSet struct {
 	relative bool
 }
 
+// channelOut is split around files and properties so a read header
+// (readChannel) can replace those two with catalog indexes and keep every
+// key in the same place.
 type channelOut struct {
-	Name            string         `json:"name"`
-	Group           string         `json:"group"`
-	Samples         int            `json:"samples"`
-	Timed           bool           `json:"timed"`
-	IsTimestamp     bool           `json:"is_timestamp"`
-	Source          string         `json:"source"`
-	Dt              float64        `json:"dt"`
-	Basis           string         `json:"basis,omitempty"`
-	Files           []string       `json:"files"`
-	Columns         []string       `json:"columns"`
-	Scaled          bool           `json:"scaled"`
-	HasScale        bool           `json:"has_scale"`
-	Scale           *scaleOut      `json:"scale,omitempty"`
-	HasNonlinear    bool           `json:"has_nonlinear_scale"`
-	DAQmx           bool           `json:"daqmx,omitempty"`
-	Digital         bool           `json:"digital,omitempty"`
-	DAQmxScale      bool           `json:"daqmx_scale,omitempty"`
-	Unit            string         `json:"unit,omitempty"`
-	DataType        string         `json:"data_type,omitempty"`
-	Properties      map[string]any `json:"properties,omitempty"`
-	PropertiesMatch bool           `json:"properties_match"`
-	Gaps            []gapOut       `json:"gaps,omitempty"`
-	AbsoluteOmitted bool           `json:"absolute_omitted,omitempty"`
+	outHead
+	Files []string `json:"files"`
+	outMid
+	Properties map[string]any `json:"properties,omitempty"`
+	outTail
+}
+
+type outHead struct {
+	Name        string  `json:"name"`
+	Group       string  `json:"group"`
+	Samples     int     `json:"samples"`
+	Timed       bool    `json:"timed"`
+	IsTimestamp bool    `json:"is_timestamp"`
+	Source      string  `json:"source"`
+	Dt          float64 `json:"dt"`
+	Basis       string  `json:"basis,omitempty"`
+}
+
+type outMid struct {
+	Columns      []string  `json:"columns"`
+	Scaled       bool      `json:"scaled"`
+	HasScale     bool      `json:"has_scale"`
+	Scale        *scaleOut `json:"scale,omitempty"`
+	HasNonlinear bool      `json:"has_nonlinear_scale"`
+	DAQmx        bool      `json:"daqmx,omitempty"`
+	Digital      bool      `json:"digital,omitempty"`
+	DAQmxScale   bool      `json:"daqmx_scale,omitempty"`
+	Unit         string    `json:"unit,omitempty"`
+	DataType     string    `json:"data_type,omitempty"`
+}
+
+type outTail struct {
+	PropertiesMatch bool     `json:"properties_match"`
+	Gaps            []gapOut `json:"gaps,omitempty"`
+	AbsoluteOmitted bool     `json:"absolute_omitted,omitempty"`
 	// Clock is the result_begin clock id with this channel's times. It is
 	// absent for an untimed channel and when absolute time was not asked
 	// for. Stream is the channel's stream id. Bundles have neither: each
@@ -75,6 +90,9 @@ type seriesEnc struct {
 	useNative   bool
 	nat         *nativeCol
 	meta        channelOut
+	// propsAt is the catalog index of the occurrence whose properties
+	// apply, or -1. Read headers send it instead of the properties.
+	propsAt int
 }
 
 func prepareSeries(s dataset.Series, cols columnSet, info scaleInfo, requestScaled, propsMatch bool, nat *nativeCol) (*seriesEnc, error) {
@@ -95,27 +113,33 @@ func prepareSeries(s dataset.Series, cols columnSet, info scaleInfo, requestScal
 			return nil, errCode("argument", "cannot read "+nat.dt.String()+" as a Polars column")
 		}
 	}
-	e := &seriesEnc{ser: s, cols: cols, info: info, applyLinear: applyLinear, useNative: useNative, nat: nat}
+	e := &seriesEnc{ser: s, cols: cols, info: info, applyLinear: applyLinear, useNative: useNative, nat: nat, propsAt: -1}
 	e.meta = channelOut{
-		Name:            s.Name,
-		Group:           s.Group,
-		Samples:         len(s.Y),
-		Timed:           s.Timed,
-		IsTimestamp:     s.IsTimestamp,
-		Source:          s.Source.String(),
-		Dt:              s.Dt,
-		Files:           append([]string(nil), s.Files...),
-		Scaled:          metaScaled,
-		HasScale:        info.hasLinear,
-		HasNonlinear:    info.nonlinear,
-		DAQmx:           info.daqmx,
-		Digital:         info.digital,
-		DAQmxScale:      info.willScale,
-		Unit:            info.unit,
-		DataType:        info.dataType,
-		Properties:      info.properties,
-		PropertiesMatch: propsMatch,
-		AbsoluteOmitted: cols.absolute && !e.hasTimes(),
+		outHead: outHead{
+			Name:        s.Name,
+			Group:       s.Group,
+			Samples:     len(s.Y),
+			Timed:       s.Timed,
+			IsTimestamp: s.IsTimestamp,
+			Source:      s.Source.String(),
+			Dt:          s.Dt,
+		},
+		Files: append([]string(nil), s.Files...),
+		outMid: outMid{
+			Scaled:       metaScaled,
+			HasScale:     info.hasLinear,
+			HasNonlinear: info.nonlinear,
+			DAQmx:        info.daqmx,
+			Digital:      info.digital,
+			DAQmxScale:   info.willScale,
+			Unit:         info.unit,
+			DataType:     info.dataType,
+		},
+		Properties: info.properties,
+		outTail: outTail{
+			PropertiesMatch: propsMatch,
+			AbsoluteOmitted: cols.absolute && !e.hasTimes(),
+		},
 	}
 	if !s.Basis.IsZero() || s.Timed {
 		e.meta.Basis = s.Basis.UTC().Format(time.RFC3339Nano)
