@@ -65,6 +65,7 @@ include = [
   "/THIRD_PARTY.md",
   "/EXTRACTION.md",
   "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
 ]
 exclude = [
   "/python/src/gotdms/_bin",
