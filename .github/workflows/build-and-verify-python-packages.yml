@@ -65,5 +65,5 @@ jobs:
         # nptdms is LGPL-3.0-only. Installed in this venv only so the oracle
         # test can read a file the package wrote. Not a project dependency.
         run: |
-          /tmp/gotdms-venv/bin/pip install nptdms
+          /tmp/gotdms-venv/bin/pip install nptdms==1.13.0
           /tmp/gotdms-venv/bin/python -m unittest discover -s python/tests

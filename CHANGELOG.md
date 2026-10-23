@@ -4,6 +4,7 @@ Nothing in this repository has been tagged. Nothing has been uploaded to PyPI.
 
 ## Unreleased
 
+- CI runs the Python tests at the minimum supported versions (Python 3.10, numpy 1.26.0, pyarrow 14.0.0, polars 2.0.0) in a job named `Test at minimum supported versions (Python 3.10, numpy 1.26, pyarrow 14, polars 2.0)`. Every CI install of npTDMS, the LGPL-3.0-only test oracle, is pinned to `nptdms==1.13.0`.
 - A bad TDMS file raises `CorruptFileError` (code `corrupt`) from `open`, `scan_tdms`, and `read_tdms`. That covers a wrong segment tag, an unsupported version, a corrupt structure, and a truncated file. Before, `read_tdms` and append-mode `write_tdms` raised `ArgumentError` and `open` and `scan_tdms` raised `GotdmsError` with code `error`. `CorruptFileError` subclasses `GotdmsError`. A missing path is `ArgumentError` from all three; before, `open` and `scan_tdms` raised `GotdmsError` with code `error` for it. The bridge sends the new code; protocol version stays 1.
 - A `Session` that is dropped without `close` stops its bridge process when it is garbage collected (`weakref.finalize`). Before, the stderr thread kept the session alive and the process ran until the interpreter exited. At interpreter exit the finalizer does not write to a bridge that another thread is still reading from; it closes stdin and the bridge exits. `close` and `with` are still preferred.
 - Bridge stderr kept for error messages is capped at the last 64 KiB per process.

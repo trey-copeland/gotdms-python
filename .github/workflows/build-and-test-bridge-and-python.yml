@@ -77,10 +77,41 @@ jobs:
         if: matrix.python
         # nptdms is LGPL-3.0-only. CI uses it as a reader of files this
         # package wrote. It is not a runtime dependency and it is not shipped.
-        run: python -m pip install numpy pyarrow polars nptdms
+        # It is pinned so a new npTDMS release cannot fail CI by itself.
+        run: python -m pip install numpy pyarrow polars nptdms==1.13.0
 
       - name: Python unit tests
         if: matrix.python
+        run: python -m unittest discover -s python/tests
+
+  minimum-versions:
+    # pyproject.toml declares requires-python >=3.10, numpy>=1.26,
+    # pyarrow>=14, and polars>=2. This job installs exactly those floors so a
+    # change that needs a newer Python or library fails here, not for a user.
+    name: Test at minimum supported versions (Python 3.10, numpy 1.26, pyarrow 14, polars 2.0)
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install the minimum supported dependencies
+        # nptdms is LGPL-3.0-only and is the CI-only oracle, as above.
+        run: python -m pip install "numpy==1.26.0" "pyarrow==14.0.0" "polars==2.0.0" "nptdms==1.13.0"
+
+      - name: Show installed versions
+        run: python -c "import sys, numpy, pyarrow, polars; print(sys.version); print('numpy', numpy.__version__, 'pyarrow', pyarrow.__version__, 'polars', polars.__version__)"
+
+      - name: Python unit tests
         run: python -m unittest discover -s python/tests
 
   windows:
@@ -109,7 +140,8 @@ jobs:
       - name: Install Python test dependencies
         # nptdms is LGPL-3.0-only. CI uses it as a reader of files this
         # package wrote. It is not a runtime dependency and it is not shipped.
-        run: python -m pip install numpy pyarrow polars nptdms
+        # It is pinned so a new npTDMS release cannot fail CI by itself.
+        run: python -m pip install numpy pyarrow polars nptdms==1.13.0
 
       - name: Python unit tests
         run: python -m unittest discover -s python/tests
