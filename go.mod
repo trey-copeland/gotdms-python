@@ -2,14 +2,15 @@ module github.com/trey-copeland/gotdms-python
 
 go 1.22.0
 
-// github.com/trey-copeland/gotdms v0.1.2 is commit
-// 8d2f134a160600c8a12b2076cc395c6b05c5c9e2. It skips bytes between the
-// object list and the raw-data offset, so a file with that metadata
-// padding opens. v0.1.1 is 7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8.
-// This module does not build segment-index sidecars. See EXTRACTION.md.
+// github.com/trey-copeland/gotdms v0.2.0 is commit
+// 290bb791b00ad56edeee814960062107d0600cc8. It is the first core tag with
+// dataset.WithSharedClock and dataset.WithoutTimes, which protocol 2
+// reads with. v0.1.2 (8d2f134a160600c8a12b2076cc395c6b05c5c9e2) added the
+// metadata-padding skip. This module does not build segment-index
+// sidecars. See EXTRACTION.md.
 require (
 	github.com/apache/arrow-go/v18 v18.0.0
-	github.com/trey-copeland/gotdms v0.1.2
+	github.com/trey-copeland/gotdms v0.2.0
 )
 
 require (

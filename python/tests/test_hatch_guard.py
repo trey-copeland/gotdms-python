@@ -56,8 +56,8 @@ class HatchGuardTest(unittest.TestCase):
                 self.assertEqual(find(text), want)
 
     def test_this_checkout(self):
-        # The dev-only commit replaces gotdms with a local core; the guard
-        # must refuse that tree, and accept go.mod without the replace.
+        # A development checkout may replace gotdms with a local core; the
+        # guard must accept this go.mod once any replace line is removed.
         find = _load().local_gotdms_replace
         text = (ROOT / "go.mod").read_text(encoding="utf-8")
         lines = [line for line in text.splitlines() if not line.startswith("replace ")]
