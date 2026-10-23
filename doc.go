@@ -2,9 +2,13 @@
 // Apache Arrow can be linked into the gotdms-bridge binary without adding
 // dependencies to the core TDMS module.
 //
-// The interactive protocol is version 1, little-endian frames on stdin and
+// The interactive protocol is version 2, little-endian frames on stdin and
 // stdout. See Frame in frame.go. Sample columns travel as Arrow IPC streams
-// inside the frame payload. They are not JSON and not base64.
+// inside frame payloads. They are not JSON and not base64. A data reply is
+// result_begin, part frames of at most MaxPart bytes, and result_end, so it
+// has no size ceiling, and the bridge writes each stream straight from the
+// series' slices without building the reply in memory. Each distinct time
+// axis is one clock stream; channels name their clock by id.
 //
 // Batch conversion writes a directory bundle: manifest.json plus one Arrow
 // IPC stream per channel. The Python client turns those streams into Polars
@@ -19,10 +23,8 @@
 // limit. The response adds reads (the slices that were decoded) and limited.
 // Omitting both fields keeps the full dataset read.
 //
-// write_begin, write_chunk, and write_end add TDMS writing without a new
-// protocol version. read_values returns stored channel values in native
-// Arrow types. Each channel is read on its own, so an interleaved
-// channel that continues in a later segment stays in sample order.
-// Clients that only use the read ops are unchanged. Protocol version
-// stays 1.
+// write_begin, write_chunk, and write_end write TDMS files. read_values
+// returns stored channel values in native Arrow types. Each channel is read
+// on its own, so an interleaved channel that continues in a later segment
+// stays in sample order.
 package bridge

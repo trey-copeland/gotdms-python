@@ -3,15 +3,15 @@ package bridge
 import (
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
 )
 
-// ProtocolVersion is the frame version this package speaks.
-// A different version is rejected with code bad_version.
-const ProtocolVersion uint16 = 1
+// ProtocolVersion is the frame version this package speaks. A frame with
+// another version is answered with code bad_version. Version 1 is gone: the
+// client and the bridge ship together.
+const ProtocolVersion uint16 = 2
 
 // Magic is the first four bytes of every frame.
 var Magic = [4]byte{'G', 'M', 'D', 'S'}
@@ -19,6 +19,10 @@ var Magic = [4]byte{'G', 'M', 'D', 'S'}
 // MaxHeader is the largest accepted JSON header. Sample bytes are not in
 // the header; they live in the payload.
 const MaxHeader = 32 << 20
+
+// MaxPart is the largest payload the bridge puts in one part frame. A data
+// response of any size is a sequence of frames no bigger than this.
+const MaxPart = 64 << 20
 
 // Frame is one length-prefixed message.
 //
@@ -30,18 +34,27 @@ const MaxHeader = 32 << 20
 //	16 header JSON
 //	16+header_len payload
 //
-// A data payload is not a single Arrow stream when several channels are
-// returned. It is:
+// Metadata replies and errors are one frame with no payload. A data reply
+// (read, read_many, read_values) is a sequence:
 //
-//	uint32 LE count
-//	repeated: uint32 LE byte_len, then an Arrow IPC stream of that length
+//	result_begin  header: channels, clocks, and streams with exact byte
+//	              sizes; no payload
+//	part          header {"op":"part","stream":k}; payload is the next
+//	              bytes of Arrow IPC stream k, at most MaxPart
+//	...           streams are sent in order, each in one or more parts
+//	result_end    header {"op":"result_end","streams":n,"bytes":total},
+//	              or {"op":"result_end","error":{"code","message","stream"}}
+//	              when the reply failed after result_begin; stream is the
+//	              stream that was being sent
 //
-// Each stream has one record batch and its own schema metadata. The header
-// JSON lists channels in the same order. Empty responses omit the payload.
+// No stream gets more bytes than result_begin declared for it, even when it
+// fails. After a result_end with an error the session is still usable; the
+// client drops the partial streams. A clock stream has one int64 column time_ns. A
+// channel stream has y, plus relative_s when asked for, and names its clock
+// by id in the result_begin channel list.
 //
-// write_chunk is the exception: its payload is one Arrow IPC stream for a
-// single channel, not the counted envelope. write_begin and write_end carry
-// no payload. read_values uses the counted envelope.
+// write_chunk carries one Arrow IPC stream for one channel as its payload.
+// Requests are always single frames.
 type Frame struct {
 	Version uint16
 	Flags   uint16
@@ -101,13 +114,13 @@ func WriteFrame(w io.Writer, version uint16, header []byte, payload []byte) erro
 	}
 	binary.LittleEndian.PutUint32(prefix[8:12], uint32(len(header)))
 	binary.LittleEndian.PutUint32(prefix[12:16], uint32(len(payload)))
-	if _, err := w.Write(prefix[:]); err != nil {
+	// Prefix and header go out in one write; the payload is written from
+	// the caller's slice without a copy.
+	head := make([]byte, 0, len(prefix)+len(header))
+	head = append(head, prefix[:]...)
+	head = append(head, header...)
+	if _, err := w.Write(head); err != nil {
 		return err
-	}
-	if len(header) > 0 {
-		if _, err := w.Write(header); err != nil {
-			return err
-		}
 	}
 	if len(payload) > 0 {
 		if _, err := w.Write(payload); err != nil {
@@ -117,55 +130,10 @@ func WriteFrame(w io.Writer, version uint16, header []byte, payload []byte) erro
 	return nil
 }
 
-// SplitPayload returns each Arrow IPC stream in a data payload.
-func SplitPayload(payload []byte) ([][]byte, error) {
-	if len(payload) == 0 {
-		return nil, nil
-	}
-	if len(payload) < 4 {
-		return nil, errors.New("bridge: short payload")
-	}
-	n := binary.LittleEndian.Uint32(payload[:4])
-	off := 4
-	out := make([][]byte, 0, n)
-	for i := uint32(0); i < n; i++ {
-		if off+4 > len(payload) {
-			return nil, errors.New("bridge: short payload length")
-		}
-		ln := binary.LittleEndian.Uint32(payload[off : off+4])
-		off += 4
-		if off+int(ln) > len(payload) {
-			return nil, errors.New("bridge: short payload body")
-		}
-		out = append(out, payload[off:off+int(ln)])
-		off += int(ln)
-	}
-	if off != len(payload) {
-		return nil, errors.New("bridge: payload trailing bytes")
-	}
-	return out, nil
-}
-
-func joinPayload(parts [][]byte) []byte {
-	n := 4
-	for _, p := range parts {
-		n += 4 + len(p)
-	}
-	buf := make([]byte, 4, n)
-	binary.LittleEndian.PutUint32(buf[:4], uint32(len(parts)))
-	for _, p := range parts {
-		var ln [4]byte
-		binary.LittleEndian.PutUint32(ln[:], uint32(len(p)))
-		buf = append(buf, ln[:]...)
-		buf = append(buf, p...)
-	}
-	return buf
-}
-
 // checkPayloadLen reports whether n fits the uint32 payload length field.
 func checkPayloadLen(n uint64) error {
 	if n > math.MaxUint32 {
-		return fmt.Errorf("bridge: payload length %d exceeds %d; read fewer channels at a time", n, uint64(math.MaxUint32))
+		return fmt.Errorf("bridge: payload length %d exceeds %d", n, uint64(math.MaxUint32))
 	}
 	return nil
 }

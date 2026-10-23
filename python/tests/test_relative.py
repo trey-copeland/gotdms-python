@@ -113,41 +113,38 @@ class RelativeMathTest(unittest.TestCase):
                 self.assertEqual(rfc3339_to_unix_ns(text), unix * 10**9 + 5)
 
 
+def _ipc(batch) -> bytes:
+    import pyarrow as pa
+
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, batch.schema) as w:
+        w.write_batch(batch)
+    return sink.getvalue().to_pybytes()
+
+
+def _v2_reply(header: dict, streams: list, part: int, end=None) -> bytes:
+    """Frames of a protocol 2 data reply, each stream cut into parts."""
+    from gotdms.codec import MAGIC, VERSION, _PREFIX
+
+    def frame(h, payload=b""):
+        body = json.dumps(h).encode()
+        return _PREFIX.pack(MAGIC, VERSION, 0, len(body), len(payload)) + body + payload
+
+    begin = dict(header, op="result_begin", streams=[{"id": i, "kind": "x", "bytes": len(s)} for i, s in enumerate(streams)])
+    out = [frame(begin)]
+    for i, s in enumerate(streams):
+        for off in range(0, len(s), part):
+            out.append(frame({"op": "part", "stream": i}, s[off : off + part]))
+    out.append(frame(end or {"op": "result_end", "streams": len(streams), "bytes": sum(map(len, streams))}))
+    return b"".join(out)
+
+
 class ZeroCopyTest(unittest.TestCase):
-    def test_read_frame_and_split_share_one_buffer(self):
+    def test_parts_fill_one_aligned_buffer_per_stream(self):
+        # Odd part sizes put every part boundary off 8 bytes. Each stream
+        # still decodes from its own aligned buffer with no copy.
         import pyarrow as pa
-        from gotdms.codec import MAGIC, VERSION, _PREFIX, decode_ipc, read_frame, split_payload
-
-        streams = []
-        for k in range(3):
-            batch = pa.record_batch([pa.array(np.arange(1000, dtype=np.float64) + k)], names=["y"])
-            sink = pa.BufferOutputStream()
-            with pa.ipc.new_stream(sink, batch.schema) as w:
-                w.write_batch(batch)
-            streams.append(sink.getvalue().to_pybytes())
-        payload = struct.pack("<I", len(streams)) + b"".join(struct.pack("<I", len(s)) + s for s in streams)
-        header = json.dumps({"op": "result"}).encode()
-        frame = _PREFIX.pack(MAGIC, VERSION, 0, len(header), len(payload)) + header + payload
-        decoded, body = read_frame(io.BytesIO(frame))
-        self.assertEqual(decoded, {"op": "result"})
-        self.assertIsInstance(body, bytearray)
-        parts = split_payload(body)
-        self.assertTrue(all(isinstance(p, memoryview) and p.readonly for p in parts))
-        backing = np.frombuffer(body, dtype=np.uint8)
-        for k, part in enumerate(parts):
-            y, time_ns, rel = decode_ipc(part)
-            np.testing.assert_array_equal(y, np.arange(1000) + k)
-            self.assertTrue(np.shares_memory(y, backing), "y was copied")
-            self.assertFalse(y.flags.writeable)
-            self.assertIsNone(time_ns)
-            self.assertIsNone(rel)
-
-    def test_streams_are_aligned_without_a_copy(self):
-        # Each stream follows a 4-byte length, so with 8-byte-padded streams
-        # every other one starts 4 bytes off. split_payload moves those in
-        # place so Arrow, numpy, and Polars get aligned buffers.
-        import pyarrow as pa
-        from gotdms.codec import decode_ipc, split_payload
+        from gotdms.codec import decode_ipc, read_reply
 
         streams = []
         for k in range(5):
@@ -155,24 +152,148 @@ class ZeroCopyTest(unittest.TestCase):
                 [pa.array(np.arange(100 + k, dtype=np.float64) + k), pa.array(np.arange(100 + k, dtype=np.int64))],
                 names=["y", "time_ns"],
             )
-            sink = pa.BufferOutputStream()
-            with pa.ipc.new_stream(sink, batch.schema) as w:
-                w.write_batch(batch)
-            streams.append(sink.getvalue().to_pybytes())
-        self.assertTrue(all(len(s) % 8 == 0 for s in streams))
-        raw = struct.pack("<I", len(streams)) + b"".join(struct.pack("<I", len(s)) + s for s in streams)
-        for payload in (bytearray(raw), raw):
-            with self.subTest(kind=type(payload).__name__):
-                parts = split_payload(payload)
-                self.assertEqual([bytes(p) for p in parts], streams)
-                for k, part in enumerate(parts):
-                    y, time_ns, _ = decode_ipc(part)
+            streams.append(_ipc(batch))
+        for part in (1, 7, 13, 1 << 20):
+            with self.subTest(part=part):
+                reply = read_reply(io.BytesIO(_v2_reply({}, streams, part)))
+                self.assertIsNone(reply.error)
+                self.assertEqual([bytes(p) for p in reply.streams], streams)
+                self.assertTrue(all(isinstance(p, memoryview) and p.readonly for p in reply.streams))
+                for k, view in enumerate(reply.streams):
+                    y, time_ns, rel = decode_ipc(view)
                     np.testing.assert_array_equal(y, np.arange(100 + k) + k)
                     np.testing.assert_array_equal(time_ns, np.arange(100 + k))
+                    self.assertIsNone(rel)
                     self.assertTrue(y.flags.aligned and time_ns.flags.aligned, f"stream {k}")
                     self.assertEqual(y.ctypes.data % 8, 0)
-                    if isinstance(payload, bytearray):
-                        self.assertTrue(np.shares_memory(y, np.frombuffer(payload, dtype=np.uint8)), "y was copied")
+                    self.assertFalse(y.flags.writeable)
+                    self.assertTrue(np.shares_memory(y, np.frombuffer(view, dtype=np.uint8)), "y was copied")
+
+    def test_shared_clock_is_one_array(self):
+        import pyarrow as pa
+        from gotdms.codec import as_polars, read_reply, series_from_reply
+
+        n = 50
+        clock = _ipc(pa.record_batch([pa.array(np.arange(n, dtype=np.int64) * 10)], names=["time_ns"]))
+        other = _ipc(pa.record_batch([pa.array(np.arange(n, dtype=np.int64) * 7)], names=["time_ns"]))
+        chans = [_ipc(pa.record_batch([pa.array(np.full(n, float(k)))], names=["y"])) for k in range(4)]
+        meta = lambda name, clk, sid: {"name": name, "group": "g", "timed": clk is not None, "clock": clk, "stream": sid,
+                                       "basis": "1970-01-01T00:00:00Z", "samples": n}
+        header = {
+            "clocks": [{"id": 0, "samples": n, "stream": 0}, {"id": 1, "samples": n, "stream": 1}],
+            "channels": [meta("a", 0, 2), meta("b", 0, 3), meta("c", 1, 4), meta("u", None, 5)],
+        }
+        reply = read_reply(io.BytesIO(_v2_reply(header, [clock, other] + chans, 9)))
+        a, b, c, u = series_from_reply(reply.header, reply.streams)
+        self.assertIs(a.time_ns, b.time_ns)
+        self.assertIsNot(a.time_ns, c.time_ns)
+        np.testing.assert_array_equal(a.time_ns, np.arange(n) * 10)
+        np.testing.assert_array_equal(c.time_ns, np.arange(n) * 7)
+        self.assertIsNone(u.time_ns)
+        np.testing.assert_array_equal(u.relative_s, np.arange(n))
+        np.testing.assert_array_equal(b.relative_s, (np.arange(n) * 10) / 1e9)
+        frame = as_polars([a, b])
+        self.assertEqual(frame.columns, ["time", "g/a", "g/b"])
+        from gotdms import AlignmentError
+
+        with self.assertRaises(AlignmentError):
+            as_polars([a, c])
+
+    def test_bad_replies_raise(self):
+        import pyarrow as pa
+        from gotdms import ProtocolError
+        from gotdms.codec import MAGIC, VERSION, _PREFIX, read_reply, series_from_reply
+
+        blob = _ipc(pa.record_batch([pa.array(np.arange(4, dtype=np.float64))], names=["y"]))
+        good = _v2_reply({}, [blob], 16)
+
+        def frame(h, payload=b""):
+            body = json.dumps(h).encode()
+            return _PREFIX.pack(MAGIC, VERSION, 0, len(body), len(payload)) + body + payload
+
+        begin = frame({"op": "result_begin", "streams": [{"id": 0, "kind": "x", "bytes": len(blob)}]})
+        cases = {
+            "short stream": begin + frame({"op": "part", "stream": 0}, blob[:-8]) + frame({"op": "result_end"}),
+            "overflow": begin + frame({"op": "part", "stream": 0}, blob + b"x" * 8),
+            "unknown stream": begin + frame({"op": "part", "stream": 3}, blob),
+            "stray frame": begin + frame({"op": "result"}),
+            "truncated": good[:-20],
+            "old version": _PREFIX.pack(MAGIC, 1, 0, 2, 0) + b"{}",
+            "bool size": frame({"op": "result_begin", "streams": [{"id": 0, "kind": "x", "bytes": True}]}),
+            "bool stream id": begin + frame({"op": "part", "stream": False}, blob),
+            "no stream list": frame({"op": "result_begin"}),
+            "end miscounts streams": begin + frame({"op": "part", "stream": 0}, blob)
+            + frame({"op": "result_end", "streams": 2, "bytes": len(blob)}),
+            "end miscounts bytes": begin + frame({"op": "part", "stream": 0}, blob)
+            + frame({"op": "result_end", "streams": 1, "bytes": len(blob) + 1}),
+            "huge single frame": _PREFIX.pack(MAGIC, VERSION, 0, 2, (64 << 20) + 1) + b"{}",
+        }
+        two = frame({"op": "result_begin", "streams": [{"id": 0, "kind": "x", "bytes": len(blob)},
+                                                       {"id": 1, "kind": "x", "bytes": len(blob)}]})
+        cases["stream started early"] = two + frame({"op": "part", "stream": 0}, blob[:8]) + frame({"op": "part", "stream": 1}, blob)
+        cases["stream after a later one"] = (two + frame({"op": "part", "stream": 0}, blob)
+                                             + frame({"op": "part", "stream": 1}, blob[:8])
+                                             + frame({"op": "part", "stream": 0}, blob[:8]))
+        # The new checks must fire for their own reason, not because the
+        # reader later runs out of bytes.
+        why = {
+            "bool size": "has size",
+            "bool stream id": "unknown stream",
+            "no stream list": "stream list",
+            "end miscounts streams": "result_end says",
+            "end miscounts bytes": "result_end says",
+            "huge single frame": "payload",
+            "stream started early": "started with stream 0",
+            "stream after a later one": "after stream 1 started",
+        }
+        for name, data in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ProtocolError, why.get(name, "")):
+                read_reply(io.BytesIO(data))
+        # A clock id that is not in the table.
+        header = {"clocks": [], "channels": [{"name": "a", "clock": 4, "stream": 0}]}
+        reply = read_reply(io.BytesIO(_v2_reply(header, [blob], 64)))
+        with self.assertRaises(ProtocolError):
+            series_from_reply(reply.header, reply.streams)
+
+    def test_mid_stream_error_is_returned(self):
+        import pyarrow as pa
+        from gotdms.codec import read_reply
+
+        blob = _ipc(pa.record_batch([pa.array(np.arange(4, dtype=np.float64))], names=["y"]))
+        end = {"op": "result_end", "error": {"code": "corrupt", "message": "bad segment", "stream": 1}}
+        data = _v2_reply({}, [blob], 8, end=end)
+        stream = io.BytesIO(data + b"NEXT")
+        reply = read_reply(stream)
+        self.assertEqual(reply.error["code"], "corrupt")
+        self.assertIsNone(reply.streams)
+        self.assertEqual(stream.read(), b"NEXT", "reader did not stop at result_end")
+
+    def test_write_all_and_readinto_handle_short_calls(self):
+        # Unbuffered pipes (and Windows' per-call caps) can move fewer bytes
+        # than asked; both directions must loop.
+        from gotdms.codec import readinto_exact, write_all
+
+        class Short:
+            def __init__(self, data=b""):
+                self.data, self.out = data, bytearray()
+
+            def write(self, b):
+                b = bytes(b[:5])
+                self.out += b
+                return len(b)
+
+            def readinto(self, view):
+                k = min(3, len(view), len(self.data))
+                view[:k] = self.data[:k]
+                self.data = self.data[k:]
+                return k
+
+        s = Short()
+        write_all(s, b"0123456789abcdef")
+        self.assertEqual(bytes(s.out), b"0123456789abcdef")
+        buf = bytearray(10)
+        readinto_exact(Short(b"abcdefghijXYZ"), memoryview(buf))
+        self.assertEqual(bytes(buf), b"abcdefghij")
 
     def test_read_exact_without_readinto(self):
         from gotdms.codec import read_exact
@@ -238,12 +359,12 @@ class BridgeRelativeTest(unittest.TestCase):
 
     def go_series(self, session, specs, **extra):
         """Ask the bridge for both columns, the way relative=True used to."""
-        from gotdms.codec import series_from_parts, split_payload
+        from gotdms.codec import series_from_reply
 
         header = {"op": "read_many", "channels": specs, "absolute": True, "relative": True, "scaled": False}
         header.update(extra)
-        out, payload = session._rpc_raw(header)
-        return series_from_parts(out["channels"], split_payload(payload))
+        reply = session._rpc_raw(header)
+        return series_from_reply(reply.header, reply.streams)
 
     def assert_python_matches_go(self, session, specs, **extra):
         from gotdms.codec import Series
@@ -286,16 +407,22 @@ class BridgeRelativeTest(unittest.TestCase):
     def test_default_sends_one_time_column(self):
         with self.open_demo() as session:
             series, header = session.read_channels([{"group": "acq", "name": "ai0"}])
-            self.assertEqual(header["channels"][0]["columns"], ["y", "time_ns"])
+            # Protocol 2: time_ns is in the clock stream the channel names,
+            # so the channel stream itself is y only.
+            self.assertEqual(header["channels"][0]["columns"], ["y"])
+            self.assertEqual(header["channels"][0]["clock"], 0)
+            self.assertEqual(len(header["clocks"]), 1)
             self.assertIsNone(series[0]._relative_s)
             np.testing.assert_array_equal(series[0].relative_s, [0, 1, 2, 3, 4, 5])
 
             series, header = session.read_channels([{"group": "acq", "name": "ai0"}], relative=True)
-            self.assertEqual(header["channels"][0]["columns"], ["y", "time_ns"])
+            self.assertEqual(header["channels"][0]["columns"], ["y"])
             self.assertIsNotNone(series[0]._relative_s, "relative=True computes eagerly")
 
             series, header = session.read_channels([{"group": "acq", "name": "ai0"}], absolute=False, relative=True)
             self.assertEqual(header["channels"][0]["columns"], ["y", "relative_s"])
+            self.assertNotIn("clock", header["channels"][0])
+            self.assertEqual(header["clocks"], [])
             self.assertIsNone(series[0].time_ns)
             np.testing.assert_array_equal(series[0].relative_s, [0, 1, 2, 3, 4, 5])
 

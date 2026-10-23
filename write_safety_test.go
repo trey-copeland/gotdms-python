@@ -239,7 +239,7 @@ func TestNonFinitePropertiesInHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check("read_values", h)
+	check("read_values", h.(*dataResp).header)
 
 	s := &session{}
 	raw, _ := json.Marshal(path)

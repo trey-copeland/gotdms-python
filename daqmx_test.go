@@ -48,11 +48,15 @@ func TestDAQmxNativeAndScaled(t *testing.T) {
 	}
 	f.Close()
 
-	header, payload, err := readValues(path)
+	resp, _, err := readValues(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hdr := header.(map[string]any)
+	header, payload, err := respPayload(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := header
 	groups := hdr["groups"].([]map[string]any)
 	chans := groups[0]["channels"].([]map[string]any)
 	if chans[0]["daqmx"] != true || chans[0]["type"] != "int16" || chans[0]["ni_type"] != "tdsTypeI16" {

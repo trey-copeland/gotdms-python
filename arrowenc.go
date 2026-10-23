@@ -1,7 +1,6 @@
 package bridge
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -9,8 +8,6 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/trey-copeland/gotdms"
 	"github.com/trey-copeland/gotdms/dataset"
 )
@@ -44,6 +41,12 @@ type channelOut struct {
 	PropertiesMatch bool           `json:"properties_match"`
 	Gaps            []gapOut       `json:"gaps,omitempty"`
 	AbsoluteOmitted bool           `json:"absolute_omitted,omitempty"`
+	// Clock is the result_begin clock id with this channel's times. It is
+	// absent for an untimed channel and when absolute time was not asked
+	// for. Stream is the channel's stream id. Bundles have neither: each
+	// bundle file carries its own time_ns column.
+	Clock  *int `json:"clock,omitempty"`
+	Stream *int `json:"stream,omitempty"`
 }
 
 type scaleOut struct {
@@ -57,45 +60,37 @@ type gapOut struct {
 	To   string `json:"to"`
 }
 
-type table struct {
-	meta channelOut
-	ipc  []byte
+// seriesEnc is one channel of a read, checked and ready to encode.
+type seriesEnc struct {
+	ser         dataset.Series
+	cols        columnSet
+	info        scaleInfo
+	applyLinear bool
+	useNative   bool
+	nat         *nativeCol
+	meta        channelOut
 }
 
-func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, requestScaled, propsMatch bool, nat *nativeCol) (table, error) {
+func prepareSeries(s dataset.Series, cols columnSet, info scaleInfo, requestScaled, propsMatch bool, nat *nativeCol) (*seriesEnc, error) {
 	applyLinear := requestScaled && info.hasLinear && !info.daqmx
 	metaScaled := applyLinear || (requestScaled && info.daqmx && info.willScale)
 	useNative := info.daqmx && !metaScaled
-	yType := arrow.DataType(arrow.PrimitiveTypes.Float64)
 	if useNative {
 		if nat == nil || !nat.set {
-			return table{}, errCode("error", "missing DAQmx values for "+s.Group+"/"+s.Name)
+			return nil, errCode("error", "missing DAQmx values for "+s.Group+"/"+s.Name)
 		}
 		if nat.dt != info.tdmsType && info.tdmsType != 0 {
-			return table{}, errCode("error", "DAQmx type changed for "+s.Group+"/"+s.Name)
+			return nil, errCode("error", "DAQmx type changed for "+s.Group+"/"+s.Name)
 		}
 		if nativeLen(nat.vals) != len(s.Y) {
-			return table{}, errCode("error", fmt.Sprintf("DAQmx %s/%s has %d native values and %d samples", s.Group, s.Name, nativeLen(nat.vals), len(s.Y)))
+			return nil, errCode("error", fmt.Sprintf("DAQmx %s/%s has %d native values and %d samples", s.Group, s.Name, nativeLen(nat.vals), len(s.Y)))
 		}
-		yType = arrowOf(nat.dt)
-		if yType == nil {
-			return table{}, errCode("argument", "cannot read "+nat.dt.String()+" as a Polars column")
+		if arrowOf(nat.dt) == nil {
+			return nil, errCode("argument", "cannot read "+nat.dt.String()+" as a Polars column")
 		}
 	}
-	fields := []arrow.Field{{
-		Name: "y", Type: yType, Nullable: false,
-	}}
-	columns := []string{"y"}
-	abs := cols.absolute && s.Timed && len(s.Times) == len(s.Y)
-	if abs {
-		fields = append(fields, arrow.Field{Name: "time_ns", Type: arrow.PrimitiveTypes.Int64, Nullable: false})
-		columns = append(columns, "time_ns")
-	}
-	if cols.relative {
-		fields = append(fields, arrow.Field{Name: "relative_s", Type: arrow.PrimitiveTypes.Float64, Nullable: false})
-		columns = append(columns, "relative_s")
-	}
-	meta := channelOut{
+	e := &seriesEnc{ser: s, cols: cols, info: info, applyLinear: applyLinear, useNative: useNative, nat: nat}
+	e.meta = channelOut{
 		Name:            s.Name,
 		Group:           s.Group,
 		Samples:         len(s.Y),
@@ -104,7 +99,6 @@ func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, requestScale
 		Source:          s.Source.String(),
 		Dt:              s.Dt,
 		Files:           append([]string(nil), s.Files...),
-		Columns:         columns,
 		Scaled:          metaScaled,
 		HasScale:        info.hasLinear,
 		HasNonlinear:    info.nonlinear,
@@ -115,71 +109,104 @@ func encodeSeries(s dataset.Series, cols columnSet, info scaleInfo, requestScale
 		DataType:        info.dataType,
 		Properties:      info.properties,
 		PropertiesMatch: propsMatch,
-		AbsoluteOmitted: cols.absolute && !abs,
+		AbsoluteOmitted: cols.absolute && !e.hasTimes(),
 	}
 	if !s.Basis.IsZero() || s.Timed {
-		meta.Basis = s.Basis.UTC().Format(time.RFC3339Nano)
+		e.meta.Basis = s.Basis.UTC().Format(time.RFC3339Nano)
 	}
 	if info.hasLinear {
-		meta.Scale = &scaleOut{Slope: info.slope, Intercept: info.intercept, Index: info.index}
+		e.meta.Scale = &scaleOut{Slope: info.slope, Intercept: info.intercept, Index: info.index}
 	}
 	for _, g := range s.Gaps {
-		meta.Gaps = append(meta.Gaps, gapOut{
+		e.meta.Gaps = append(e.meta.Gaps, gapOut{
 			From: g.From.UTC().Format(time.RFC3339Nano),
 			To:   g.To.UTC().Format(time.RFC3339Nano),
 		})
 	}
-	md := schemaMeta(meta)
-	schema := arrow.NewSchema(fields, &md)
-	pool := memory.NewGoAllocator()
-	b := array.NewRecordBuilder(pool, schema)
-	defer b.Release()
-	if useNative {
-		if err := writeNative(b.Field(0), nat.dt, nat.vals); err != nil {
-			return table{}, err
+	return e, nil
+}
+
+// hasTimes reports whether the series has one absolute time per sample.
+func (e *seriesEnc) hasTimes() bool {
+	s := e.ser
+	if !s.Timed {
+		return false
+	}
+	if s.Clock != nil {
+		return s.Clock.Len() == len(s.Y)
+	}
+	return len(s.Times) == len(s.Y)
+}
+
+// timeNs returns the sample times as Unix nanoseconds. A shared Clock is
+// returned as is; Times are converted into a new slice.
+func (e *seriesEnc) timeNs() []int64 {
+	if e.ser.Clock != nil {
+		return e.ser.Clock.Ns
+	}
+	ns := make([]int64, len(e.ser.Times))
+	for i, t := range e.ser.Times {
+		ns[i] = t.UnixNano()
+	}
+	return ns
+}
+
+func (e *seriesEnc) yArray() (arrow.Array, error) {
+	if e.useNative {
+		return nativeArray(e.nat.dt, e.nat.vals)
+	}
+	if e.applyLinear {
+		vals := make([]float64, len(e.ser.Y))
+		for i, v := range e.ser.Y {
+			vals[i] = v*e.info.slope + e.info.intercept
 		}
-	} else {
-		yb := b.Field(0).(*array.Float64Builder)
-		if applyLinear {
-			vals := make([]float64, len(s.Y))
-			for i, v := range s.Y {
-				vals[i] = v*info.slope + info.intercept
+		return viewArray(arrow.PrimitiveTypes.Float64, vals), nil
+	}
+	return viewArray(arrow.PrimitiveTypes.Float64, e.ser.Y), nil
+}
+
+// record is the channel's Arrow record: y, then time_ns when timeNs is not
+// nil, then relative_s when asked for. A read reply sends time in clock
+// streams and passes nil; a bundle file carries its own time_ns.
+func (e *seriesEnc) record(timeNs []int64, withTime bool) (arrow.Record, error) {
+	y, err := e.yArray()
+	if err != nil {
+		return nil, err
+	}
+	fields := []arrow.Field{{Name: "y", Type: y.DataType(), Nullable: false}}
+	cols := []arrow.Array{y}
+	if withTime {
+		fields = append(fields, arrow.Field{Name: "time_ns", Type: arrow.PrimitiveTypes.Int64, Nullable: false})
+		cols = append(cols, viewArray(arrow.PrimitiveTypes.Int64, timeNs))
+	}
+	if e.cols.relative {
+		rel := e.ser.RelativeTimes()
+		if len(rel) != len(e.ser.Y) {
+			for _, c := range cols {
+				c.Release()
 			}
-			yb.AppendValues(vals, nil)
-		} else if len(s.Y) > 0 {
-			yb.AppendValues(s.Y, nil)
+			return nil, fmt.Errorf("bridge: relative time length %d, samples %d", len(rel), len(e.ser.Y))
 		}
+		fields = append(fields, arrow.Field{Name: "relative_s", Type: arrow.PrimitiveTypes.Float64, Nullable: false})
+		cols = append(cols, viewArray(arrow.PrimitiveTypes.Float64, rel))
 	}
-	next := 1
-	if abs {
-		ns := make([]int64, len(s.Times))
-		for i, t := range s.Times {
-			ns[i] = t.UnixNano()
-		}
-		b.Field(next).(*array.Int64Builder).AppendValues(ns, nil)
-		next++
+	md := schemaMeta(e.meta)
+	rec := array.NewRecord(arrow.NewSchema(fields, &md), cols, int64(len(e.ser.Y)))
+	for _, c := range cols {
+		c.Release()
 	}
-	if cols.relative {
-		rel := s.RelativeTimes()
-		if len(rel) != len(s.Y) {
-			return table{}, fmt.Errorf("bridge: relative time length %d, samples %d", len(rel), len(s.Y))
-		}
-		if len(rel) > 0 {
-			b.Field(next).(*array.Float64Builder).AppendValues(rel, nil)
-		}
+	return rec, nil
+}
+
+func columnNames(withTime, relative bool) []string {
+	out := []string{"y"}
+	if withTime {
+		out = append(out, "time_ns")
 	}
-	rec := b.NewRecord()
-	defer rec.Release()
-	var buf bytes.Buffer
-	w := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(pool))
-	if err := w.Write(rec); err != nil {
-		w.Close()
-		return table{}, err
+	if relative {
+		out = append(out, "relative_s")
 	}
-	if err := w.Close(); err != nil {
-		return table{}, err
-	}
-	return table{meta: meta, ipc: buf.Bytes()}, nil
+	return out
 }
 
 func arrowOf(dt tdms.DataType) arrow.DataType {
@@ -211,85 +238,90 @@ func arrowOf(dt tdms.DataType) arrow.DataType {
 	}
 }
 
-func writeNative(b array.Builder, dt tdms.DataType, vals any) error {
+// nativeArray views DAQmx native values as an Arrow array. Numeric types
+// are not copied. Timestamps are converted to UTC nanoseconds.
+func nativeArray(dt tdms.DataType, vals any) (arrow.Array, error) {
+	bad := func() (arrow.Array, error) {
+		return nil, errCode("argument", fmt.Sprintf("%s values have Go type %T", dt, vals))
+	}
 	switch dt {
 	case tdms.TypeInt8:
 		s, ok := vals.([]int8)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("int8 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Int8Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeInt16:
 		s, ok := vals.([]int16)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("int16 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Int16Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeInt32:
 		s, ok := vals.([]int32)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("int32 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Int32Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeInt64:
 		s, ok := vals.([]int64)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("int64 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Int64Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeUint8:
 		s, ok := vals.([]uint8)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("uint8 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Uint8Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeUint16:
 		s, ok := vals.([]uint16)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("uint16 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Uint16Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeUint32:
 		s, ok := vals.([]uint32)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("uint32 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Uint32Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeUint64:
 		s, ok := vals.([]uint64)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("uint64 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Uint64Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeFloat32:
 		s, ok := vals.([]float32)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("float32 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Float32Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeFloat64:
 		s, ok := vals.([]float64)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("float64 values have Go type %T", vals))
+			return bad()
 		}
-		b.(*array.Float64Builder).AppendValues(s, nil)
+		return viewArray(arrowOf(dt), s), nil
 	case tdms.TypeTimestamp:
 		s, ok := vals.([]tdms.Timestamp)
 		if !ok {
-			return errCode("argument", fmt.Sprintf("timestamp values have Go type %T", vals))
+			return bad()
 		}
-		tb := b.(*array.TimestampBuilder)
-		for _, ts := range s {
+		ns := make([]int64, len(s))
+		for i, ts := range s {
 			t, ok := ts.Time()
 			if !ok {
-				return errCode("argument", "timestamp does not fit in UTC nanoseconds")
+				return nil, errCode("argument", "timestamp does not fit in UTC nanoseconds")
 			}
-			tb.Append(arrow.Timestamp(t.UnixNano()))
+			ns[i] = t.UnixNano()
 		}
+		return viewArray(arrowOf(dt), ns), nil
 	default:
-		return errCode("argument", fmt.Sprintf("cannot read %s as a Polars column", dt))
+		return nil, errCode("argument", fmt.Sprintf("cannot read %s as a Polars column", dt))
 	}
-	return nil
 }
 
 func schemaMeta(m channelOut) arrow.Metadata {
@@ -325,32 +357,4 @@ func schemaMeta(m channelOut) arrow.Metadata {
 		)
 	}
 	return arrow.NewMetadata(keys, vals)
-}
-
-func decodeIPC(blob []byte) (map[string][]float64, []int64, error) {
-	r, err := ipc.NewReader(bytes.NewReader(blob))
-	if err != nil {
-		return nil, nil, err
-	}
-	defer r.Release()
-	rec, err := r.Read()
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rec.Release()
-	out := map[string][]float64{}
-	var ns []int64
-	for i := 0; i < int(rec.NumCols()); i++ {
-		name := rec.ColumnName(i)
-		switch col := rec.Column(i).(type) {
-		case *array.Float64:
-			out[name] = append([]float64(nil), col.Float64Values()...)
-		case *array.Int64:
-			ns = append([]int64(nil), col.Int64Values()...)
-			out[name] = nil
-		default:
-			return nil, nil, fmt.Errorf("bridge: unexpected column %s %T", name, rec.Column(i))
-		}
-	}
-	return out, ns, nil
 }

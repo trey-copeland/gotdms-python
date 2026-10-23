@@ -1,23 +1,34 @@
-"""Frame codec and Arrow IPC decode for gotdms-bridge.
+"""Frame codec and Arrow IPC decode for gotdms-bridge (protocol version 2).
 
-The interactive frame is little-endian:
+Every frame is little-endian:
 
     magic "GMDS" | version uint16 | flags uint16 | header_len uint32 | payload_len uint32
     header JSON | payload
 
-A multi-channel payload is ``uint32 count`` then repeated ``uint32 len`` plus
-one Arrow IPC stream. Sample columns are not JSON and not base64.
+Metadata replies and errors are one frame. A data reply (``read``,
+``read_many``, ``read_values``) is a sequence of frames:
 
-A payload is read once into one preallocated ``bytearray``. Each channel's
-stream is a ``memoryview`` into it, and Arrow decodes through
-``pyarrow.py_buffer`` without copying, so fixed-width columns are numpy views
-of that buffer. A stream that would start off an 8-byte boundary is moved
-in place first (see :func:`split_payload`), so those views are aligned. The
-buffer lives as long as any array from the response.
+* ``result_begin``: the channel list, the clock table, and ``streams``, the
+  exact byte size of every Arrow IPC stream that follows. No payload.
+* ``part``: ``{"op": "part", "stream": k}`` and the next bytes of stream
+  ``k`` (at most 64 MiB per frame). A stream may span many parts.
+* ``result_end``: ``{"op": "result_end", "streams": n, "bytes": total}``, or
+  ``"error": {"code", "message"}`` when the bridge failed after
+  ``result_begin``. The session is still in sync after that error.
+
+No frame is near the 4 GiB ``payload_len`` limit, so a reply has no size
+ceiling. Each stream gets one preallocated, 8-byte-aligned buffer, filled in
+place with ``readinto``; Arrow decodes it through ``pyarrow.py_buffer``
+without copying, so fixed-width columns are aligned numpy views of that
+buffer. Each buffer lives as long as an array from its stream.
+
+A clock stream has one ``time_ns`` int64 column and is decoded once.
+Channels with the same clock id get the same ``time_ns`` array object.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import struct
@@ -27,40 +38,100 @@ import numpy as np
 from .errors import AlignmentError, ArgumentError, GotdmsError, ProtocolError, UntimedError
 
 MAGIC = b"GMDS"
-VERSION = 1
+VERSION = 2
 _PREFIX = struct.Struct("<4sHHII")
+#: The largest part payload a bridge sends. A bigger part is a protocol
+#: error, so a corrupt length cannot make the client allocate gigabytes.
+MAX_PART = 64 << 20
+MAX_HEADER = 32 << 20
+
+#: Arrow IPC aligns every body buffer to 8 bytes from the start of its
+#: stream, so a stream buffer that starts on an 8-byte boundary decodes to
+#: aligned columns.
+_ALIGN = 8
+
+
+def _waiter(stream, events):
+    """A function that blocks until ``stream``'s descriptor is ready.
+
+    Polars installs a SIGINT handler with ``SA_RESTART``, so once it is
+    imported the kernel restarts a blocked pipe ``read`` or ``write`` after
+    Ctrl+C, and Python sees ``KeyboardInterrupt`` only when the bridge next
+    moves bytes. ``poll`` is never restarted after a signal handler, so
+    waiting in ``poll`` first keeps a read or write on the bridge pipe
+    interruptible. Only an unbuffered ``FileIO`` is waited on: a buffered
+    stream can hold bytes its descriptor no longer shows. Returns ``None`` on
+    Windows (no ``poll`` on pipes) and for any other stream.
+    """
+    if not _POLLIN or not isinstance(stream, io.FileIO):
+        return None
+    try:
+        poller = _select.poll()
+        poller.register(stream.fileno(), events)
+    except (OSError, ValueError):
+        return None
+    return poller.poll
+
+
+try:
+    import select as _select
+
+    _POLLIN = _select.POLLIN
+    _POLLOUT = _select.POLLOUT
+except (ImportError, AttributeError):  # Windows has no select.poll
+    _POLLIN = _POLLOUT = 0
+
+
+def write_all(stream, data) -> None:
+    """Write every byte of ``data``.
+
+    The bridge pipes are unbuffered ``FileIO`` objects (``bufsize=0``).
+    ``FileIO.write`` may write fewer bytes than asked, and on Windows one
+    call is capped near 2 GiB, so a single ``write`` is not enough.
+    """
+    view = memoryview(data).cast("B")
+    wait = _waiter(stream, _POLLOUT) if len(view) else None
+    while len(view):
+        if wait is not None:
+            wait()
+        n = stream.write(view)
+        if n is None:
+            raise ProtocolError("bridge pipe would block")
+        if n <= 0:
+            raise ProtocolError("bridge closed the stream")
+        view = view[n:]
 
 
 def write_frame(stream, header: dict, payload: bytes | None = None) -> None:
     """Write one protocol frame. ``payload`` is raw bytes, not JSON.
 
-    Read responses and ``read_values`` use the counted multi-channel
-    envelope inside the payload. ``write_chunk`` puts one Arrow IPC stream
-    in the payload directly.
+    ``write_chunk`` puts one Arrow IPC stream in the payload. Every other
+    request has no payload.
     """
     body = json.dumps(header, separators=(",", ":")).encode()
     payload = payload or b""
     if len(payload) > 0xFFFFFFFF:
         raise ArgumentError("Arrow chunk exceeds the frame payload limit (4 GiB)")
-    stream.write(_PREFIX.pack(MAGIC, VERSION, 0, len(body), len(payload)))
-    if body:
-        stream.write(body)
+    write_all(stream, _PREFIX.pack(MAGIC, VERSION, 0, len(body), len(payload)) + body)
     if payload:
-        stream.write(payload)
+        write_all(stream, payload)
     stream.flush()
 
 
-def read_exact(stream, n: int) -> bytearray:
-    """Read exactly ``n`` bytes into one new ``bytearray``.
+def readinto_exact(stream, view: memoryview) -> None:
+    """Fill ``view`` from ``stream``.
 
-    ``readinto`` fills the preallocated buffer in place. A stream without
-    ``readinto`` falls back to ``read`` and one copy per chunk.
+    ``readinto`` may return fewer bytes than asked (a pipe returns what is
+    there, and Windows caps one call near 2 GiB), so this loops. A stream
+    without ``readinto`` falls back to ``read`` and one copy per chunk.
     """
-    buf = bytearray(n)
-    view = memoryview(buf)
+    n = len(view)
     got = 0
     readinto = getattr(stream, "readinto", None)
+    wait = _waiter(stream, _POLLIN) if n else None
     while got < n:
+        if wait is not None:
+            wait()
         if readinto is not None:
             k = readinto(view[got:])
         else:
@@ -70,91 +141,148 @@ def read_exact(stream, n: int) -> bytearray:
         if not k:
             raise ProtocolError("bridge closed the stream")
         got += k
-    view.release()
+
+
+def read_exact(stream, n: int) -> bytearray:
+    """Read exactly ``n`` bytes into one new ``bytearray``."""
+    buf = bytearray(n)
+    with memoryview(buf) as view:
+        readinto_exact(stream, view)
     return buf
+
+
+def read_head(stream):
+    """Read one frame prefix and header. Returns ``(header, payload_len)``.
+
+    The caller reads the payload, so a part can go straight into its
+    stream's buffer.
+    """
+    magic, version, _flags, hlen, plen = _PREFIX.unpack(read_exact(stream, _PREFIX.size))
+    if magic != MAGIC:
+        raise ProtocolError(f"bad magic {magic!r}")
+    if hlen > MAX_HEADER:
+        raise ProtocolError(f"header length {hlen} exceeds {MAX_HEADER}")
+    raw = read_exact(stream, hlen) if hlen else b""
+    if version != VERSION:
+        # Skip the payload so the pipe stays in sync, then refuse.
+        if plen:
+            read_exact(stream, plen)
+        raise ProtocolError(
+            f"gotdms-bridge speaks protocol version {version}, this client needs {VERSION}. "
+            "Rebuild gotdms-bridge or unset GOTDMS_BRIDGE to use the bundled one."
+        )
+    return (json.loads(raw) if raw else {}), plen
 
 
 def read_frame(stream):
     """Read one frame. The payload is a ``bytearray`` (empty when absent)."""
-    magic, version, _flags, hlen, plen = _PREFIX.unpack(read_exact(stream, _PREFIX.size))
-    if magic != MAGIC:
-        raise ProtocolError(f"bad magic {magic!r}")
-    header = read_exact(stream, hlen) if hlen else b""
+    header, plen = read_head(stream)
     payload = read_exact(stream, plen) if plen else bytearray()
-    if version != VERSION:
-        raise ProtocolError(f"protocol version {version}, want {VERSION}")
-    if not header:
-        return {}, payload
-    return json.loads(header), payload
+    return header, payload
 
 
-#: Arrow IPC aligns every body buffer to 8 bytes from the start of its
-#: stream, so a stream that starts on an 8-byte boundary decodes to aligned
-#: columns.
-_ALIGN = 8
+def aligned_buffer(n: int) -> np.ndarray:
+    """A writable ``uint8`` array of ``n`` bytes whose first byte is 8-aligned."""
+    raw = np.empty(n + _ALIGN, dtype=np.uint8)
+    pad = (-raw.ctypes.data) % _ALIGN
+    return raw[pad : pad + n]
 
 
-def split_payload(payload) -> list[memoryview]:
-    """Split the counted envelope into one read-only view per Arrow stream.
+class Reply:
+    """One reply. ``header`` is the single frame, or ``result_begin`` of a
+    data reply. ``streams`` is ``None`` for a single frame, else one
+    read-only ``memoryview`` per stream id. ``error`` is the ``result_end``
+    error, if any; its streams are partial and must not be decoded."""
 
-    The views share ``payload``. In the envelope each stream follows a 4-byte
-    length, so with 8-byte-padded streams every other one starts 4 bytes off
-    an 8-byte boundary. Arrow decodes such a stream to misaligned numpy and
-    Polars buffers. When ``payload`` is a ``bytearray`` (what
-    :func:`read_frame` returns), a misaligned stream is moved left in place
-    over its own, already parsed, length prefix, so no memory is allocated.
-    A stream that cannot move that way, or one in an immutable ``bytes``,
-    is copied into its own aligned buffer.
+    __slots__ = ("header", "payload", "streams", "end", "error")
+
+    def __init__(self, header, payload=b"", streams=None, end=None, error=None):
+        self.header = header
+        self.payload = payload
+        self.streams = streams
+        self.end = end
+        self.error = error
+
+
+def _is_int(value) -> bool:
+    # JSON true is a Python bool, which is an int; it is not a size or an id.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def read_reply(stream) -> Reply:
+    """Read one reply: a single frame, or a whole data reply.
+
+    A framing fault raises :class:`ProtocolError` and leaves the pipe out of
+    sync; the caller must discard the bridge. A ``result_end`` error is
+    returned in :attr:`Reply.error` with the pipe still in sync.
+
+    Streams arrive in id order, each filled to exactly its declared size
+    before the next one starts. No frame payload is over :data:`MAX_PART`,
+    so a corrupt length cannot make the client allocate or wait for gigabytes
+    outside a declared stream.
     """
-    if not payload:
-        return []
-    if len(payload) < 4:
-        raise ProtocolError("short payload")
-    (count,) = struct.unpack_from("<I", payload, 0)
-    spans = []
-    off = 4
-    for _ in range(count):
-        if off + 4 > len(payload):
-            raise ProtocolError("short payload length")
-        (ln,) = struct.unpack_from("<I", payload, off)
-        off += 4
-        end = off + ln
-        if end > len(payload):
-            raise ProtocolError("short payload body")
-        spans.append((off, ln))
-        off = end
-    if off != len(payload):
-        raise ProtocolError("payload trailing bytes")
-    return _aligned_views(payload, spans)
-
-
-def _aligned_views(payload, spans) -> list[memoryview]:
-    import ctypes
-
-    mutable = isinstance(payload, bytearray)
-    backing = np.frombuffer(payload, dtype=np.uint8)
-    base = backing.ctypes.data
-    whole = memoryview(payload).toreadonly()
-    parts = []
-    free = 0  # first byte not used by an earlier stream
-    for start, ln in spans:
-        shift = (base + start) % _ALIGN
-        if shift == 0 or ln == 0:
-            parts.append(whole[start : start + ln])
-            free = start + ln
-            continue
-        if mutable and start - shift >= free:
-            ctypes.memmove(base + start - shift, base + start, ln)
-            parts.append(whole[start - shift : start - shift + ln])
-            free = start - shift + ln
-            continue
-        own = np.empty(ln + _ALIGN, dtype=np.uint8)
-        pad = (-own.ctypes.data) % _ALIGN
-        own = own[pad : pad + ln]
-        own[:] = backing[start : start + ln]
-        parts.append(memoryview(own).toreadonly())
-        free = start + ln
-    return parts
+    header, plen = read_head(stream)
+    if header.get("op") != "result_begin":
+        if plen > MAX_PART:
+            raise ProtocolError(f"{header.get('op')!r} frame with a {plen}-byte payload")
+        payload = read_exact(stream, plen) if plen else bytearray()
+        return Reply(header, payload)
+    if plen:
+        raise ProtocolError("result_begin with a payload")
+    specs = header.get("streams")
+    if not isinstance(specs, list):
+        raise ProtocolError("result_begin without a stream list")
+    sizes = []
+    for i, spec in enumerate(specs):
+        if not isinstance(spec, dict) or spec.get("id") != i or not _is_int(spec.get("id")):
+            raise ProtocolError(f"stream {i} is {spec!r}")
+        size = spec.get("bytes")
+        if not _is_int(size) or size < 0:
+            raise ProtocolError(f"stream {i} has size {size!r}")
+        sizes.append(size)
+    bufs = [aligned_buffer(size) for size in sizes]
+    filled = [0] * len(bufs)
+    cur = 0  # the stream being filled; every earlier one is complete
+    while True:
+        part, plen = read_head(stream)
+        op = part.get("op")
+        if op == "part":
+            k = part.get("stream")
+            if not _is_int(k) or not 0 <= k < len(bufs):
+                raise ProtocolError(f"part for unknown stream {k!r}")
+            if plen == 0 or plen > MAX_PART:
+                raise ProtocolError(f"part of {plen} bytes")
+            if k < cur:
+                raise ProtocolError(f"part for stream {k} after stream {cur} started")
+            while cur < k:
+                if filled[cur] != sizes[cur]:
+                    raise ProtocolError(f"stream {k} started with stream {cur} at {filled[cur]} of {sizes[cur]} bytes")
+                cur += 1
+            off = filled[k]
+            if off + plen > sizes[k]:
+                raise ProtocolError(f"stream {k} overflows its {sizes[k]} bytes")
+            with memoryview(bufs[k]) as whole:
+                readinto_exact(stream, whole[off : off + plen])
+            filled[k] = off + plen
+        elif op == "result_end":
+            if plen:
+                raise ProtocolError("result_end with a payload")
+            err = part.get("error")
+            if err:
+                if not isinstance(err, dict):
+                    raise ProtocolError(f"result_end error {err!r}")
+                return Reply(header, b"", None, part, err)
+            for k, buf in enumerate(bufs):
+                if filled[k] != sizes[k]:
+                    raise ProtocolError(f"stream {k} has {filled[k]} of {sizes[k]} bytes")
+            if part.get("streams") != len(bufs) or part.get("bytes") != sum(sizes):
+                raise ProtocolError(
+                    f"result_end says {part.get('streams')!r} streams, {part.get('bytes')!r} bytes; "
+                    f"result_begin declared {len(bufs)} and {sum(sizes)}"
+                )
+            return Reply(header, b"", [memoryview(b).toreadonly() for b in bufs], part)
+        else:
+            raise ProtocolError(f"unexpected {op!r} frame inside a data reply")
 
 
 class Series:
@@ -329,12 +457,41 @@ def decode_ipc(blob):
     return y, time_ns, relative
 
 
-def series_from_parts(metas: list, parts: list[bytes]) -> list[Series]:
-    if len(metas) != len(parts):
-        raise ProtocolError(f"{len(metas)} channel headers and {len(parts)} payloads")
+def decode_clock(blob) -> np.ndarray:
+    """Decode a clock stream: one int64 ``time_ns`` column, zero-copy."""
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    table = ipc.open_stream(pa.py_buffer(blob)).read_all()
+    if table.column_names != ["time_ns"]:
+        raise ProtocolError(f"clock stream has columns {table.column_names}")
+    return np.asarray(table.column("time_ns").to_numpy(zero_copy_only=False), dtype=np.int64)
+
+
+def series_from_reply(header: dict, streams: list) -> list[Series]:
+    """Build one :class:`Series` per channel of a ``result_begin`` header.
+
+    Each clock is decoded once. Channels with the same clock id share that
+    ``time_ns`` array object.
+    """
+    clocks = {}
+    for clock in header.get("clocks") or []:
+        clocks[clock["id"]] = decode_clock(streams[clock["stream"]])
+        if len(clocks[clock["id"]]) != clock.get("samples", -1):
+            raise ProtocolError(f"clock {clock['id']} has {len(clocks[clock['id']])} samples")
     out = []
-    for meta, blob in zip(metas, parts):
-        y, time_ns, relative = decode_ipc(blob)
+    for meta in header.get("channels") or []:
+        sid = meta.get("stream")
+        if not isinstance(sid, int) or not 0 <= sid < len(streams):
+            raise ProtocolError(f"channel {meta.get('name')!r} has stream {sid!r}")
+        y, time_ns, relative = decode_ipc(streams[sid])
+        clock = meta.get("clock")
+        if clock is not None:
+            if clock not in clocks:
+                raise ProtocolError(f"channel {meta.get('name')!r} names unknown clock {clock!r}")
+            time_ns = clocks[clock]
+            if len(time_ns) != len(y):
+                raise ProtocolError(f"channel {meta.get('name')!r} has {len(y)} samples and clock {clock} {len(time_ns)}")
         out.append(Series(meta, y, time_ns, relative))
     return out
 
@@ -385,7 +542,7 @@ def as_polars(series: list[Series], *, time: str = "column", absolute_time: bool
         if absolute_time:
             if item.time_ns is None:
                 raise UntimedError(f"{item.group}/{item.name} has no absolute time")
-            keys.append(np.asarray(item.time_ns))
+            keys.append(item.time_ns if isinstance(item.time_ns, np.ndarray) else np.asarray(item.time_ns))
         else:
             if item.relative_s is None:
                 raise GotdmsError(f"{item.group}/{item.name} has no relative time")
@@ -394,7 +551,8 @@ def as_polars(series: list[Series], *, time: str = "column", absolute_time: bool
     key_name = "time" if absolute_time else "relative_s"
     if align == "strict":
         for key in keys[1:]:
-            if not np.array_equal(keys[0], key):
+            # Channels on one bridge clock hold the same array object.
+            if key is not keys[0] and not np.array_equal(keys[0], key):
                 raise AlignmentError(
                     "channels do not share a time vector; pass align='nptdms' for a full join"
                 )

@@ -140,11 +140,11 @@ func Convert(opt ConvertOptions) error {
 		putR("start", opt.WindowStart.UTC().Format(time.RFC3339Nano))
 		putR("end", opt.WindowEnd.UTC().Format(time.RFC3339Nano))
 	}
-	tables, err := s.readMany(sels, readReq)
+	encs, err := s.readMany(sels, readReq)
 	if err != nil {
 		return err
 	}
-	return writeBundle(opt.OutDir, s.ds.Basis(), tables)
+	return writeBundle(opt.OutDir, s.ds.Basis(), encs)
 }
 
 type bundleChannel struct {
@@ -152,17 +152,24 @@ type bundleChannel struct {
 	Path string `json:"path"`
 }
 
-func writeBundle(dir string, basis time.Time, tables []table) error {
+func writeBundle(dir string, basis time.Time, encs []*seriesEnc) error {
 	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o755); err != nil {
 		return err
 	}
-	entries := make([]bundleChannel, len(tables))
-	for i, t := range tables {
+	entries := make([]bundleChannel, len(encs))
+	for i, e := range encs {
 		rel := fmt.Sprintf("data/%d.arrow", i)
-		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(rel)), t.ipc, 0o644); err != nil {
+		// A bundle file stands alone, so it keeps its own time_ns column.
+		withTime := e.cols.absolute && e.hasTimes()
+		var ns []int64
+		if withTime {
+			ns = e.timeNs()
+		}
+		e.meta.Columns = columnNames(withTime, e.cols.relative)
+		if err := writeBundleFile(filepath.Join(dir, filepath.FromSlash(rel)), e, ns, withTime); err != nil {
 			return err
 		}
-		entries[i] = bundleChannel{channelOut: t.meta, Path: rel}
+		entries[i] = bundleChannel{channelOut: e.meta, Path: rel}
 	}
 	doc := struct {
 		GotdmsBridge int             `json:"gotdms_bridge"`
@@ -184,4 +191,21 @@ func writeBundle(dir string, basis time.Time, tables []table) error {
 	b = restoreNonFinite(b)
 	b = append(b, '\n')
 	return os.WriteFile(filepath.Join(dir, "manifest.json"), b, 0o644)
+}
+
+func writeBundleFile(path string, e *seriesEnc, ns []int64, withTime bool) error {
+	rec, err := e.record(ns, withTime)
+	if err != nil {
+		return err
+	}
+	defer rec.Release()
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := writeRecord(f, rec); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

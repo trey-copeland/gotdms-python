@@ -212,7 +212,7 @@ bundle/
 
 `manifest.json` fields:
 
-- `gotdms_bridge`: protocol version `1`
+- `gotdms_bridge`: protocol version of the bridge that wrote it (`2`). The bundle layout itself did not change with protocol 2.
 - `format`: `arrow-ipc-stream`
 - `basis`: dataset basis, RFC3339
 - `channels[]`: `path` (`data/N.arrow`), `name`, `group`, `data_type`, `basis`, `timed`, `scaled`, `has_scale`, `scale`, `unit`, `properties`, `files`, `columns`, `gaps`
@@ -225,7 +225,7 @@ Each `.arrow` file is one Arrow IPC stream with one record batch. The schema met
 
 ```text
 0   magic "GMDS"
-4   version uint16 = 1
+4   version uint16 = 2
 6   flags uint16 = 0
 8   header_len uint32
 12  payload_len uint32
@@ -233,13 +233,29 @@ Each `.arrow` file is one Arrow IPC stream with one record batch. The schema met
     payload
 ```
 
-A data payload is `uint32` count, then for each channel `uint32` byte length and one Arrow IPC stream. The header's `channels` array is in the same order. Empty payloads are metadata replies. Errors are `{"op":"error","code":"...","message":"..."}` and the Python client raises the matching exception. A version other than 1 returns `bad_version` and the process keeps reading.
+Metadata replies are one `{"op":"result",...}` frame with no payload. Errors are `{"op":"error","code":"...","message":"..."}` and the Python client raises the matching exception. A version other than 2 returns `bad_version` and the process keeps reading. Version 1 is gone; the client refuses a version 1 bridge with a `ProtocolError`.
+
+A data reply (`read`, `read_many`, `read_values`) is a sequence of frames, so it has no size ceiling:
+
+```text
+result_begin  {"op":"result_begin", "channels":[...], "clocks":[...],
+               "streams":[{"id":0,"kind":"clock","bytes":N}, ...],
+               "reads":[...], "limited":false}            no payload
+part          {"op":"part","stream":k}                     next bytes of stream k, at most 64 MiB
+...           streams in id order, each in one or more parts
+result_end    {"op":"result_end","streams":n,"bytes":total}
+          or  {"op":"result_end","error":{"code":"...","message":"...","stream":k}}
+```
+
+Every stream is one Arrow IPC stream with one record batch, and `bytes` is its exact size, so the client allocates each stream's buffer once and fills it in place. A `clock` stream has one column, `time_ns` (`int64` Unix nanoseconds). Each distinct time axis is sent once: channels on one timestamp channel, waveform channels with the same start, increment, and sample range, and any other channels whose times are equal sample for sample share a clock. A `channel` stream has `y`, plus `relative_s` when relative time was requested. Each `channels[]` entry names its `stream` and, when it is timed and absolute time was requested, its `clock` id. An untimed channel has no `clock` and sets `absolute_omitted` when absolute time was requested. `read_values` streams have kind `values`, and each channel entry names its `stream`.
+
+An error after `result_begin` (for example, a value that cannot be encoded, or a stream that came out longer or shorter than declared) ends the reply with `result_end` and an `error`. The bridge never sends more bytes of a stream than declared. The client drops the partial streams, raises the matching exception, and keeps the session. A reply that stops without `result_end` (the bridge died, or the client was interrupted) leaves the pipe out of sync, so the client kills the bridge and the session raises `ProtocolError` from then on. `GOTDMS_BRIDGE_PART_BYTES` (an integer from 1 to 67108864) lowers the part cap for tests; it cannot raise it, and any other value makes `gotdms-bridge serve` exit with status 2. The client rejects any frame payload over 64 MiB, a part for a stream before the previous stream is complete, and a `result_end` whose `streams` or `bytes` disagree with `result_begin`.
 
 Requests: `open`, `describe`, `catalog`, `find`, `search`, `match`, `read`, `read_many`, `close`, `write_begin`, `write_chunk`, `write_end`, `read_values`. `open` and `describe` take `paths` or `directory` plus `pattern`, `timestamp_channel`, `timestamp_channels`, `numeric_epoch`, `basis`, `overlap` (`keep_first`, `keep_last`, `error`), `workers`, and `read_workers`. `describe` returns `sample_reads` (0), `files`, `groups`, and `channels`. It does not call `dataset.Open` and does not decode samples. Reads take `absolute` (default true), `relative` (default true), `scaled` (default false), optional `basis`, optional `start` and `end`, and optional `offset` and `limit`.
 
-`write_begin`, `write_chunk`, and `write_end` are the export. `write_begin` names the path, mode (`create` or `append`), file properties, and groups. `write_chunk` carries one Arrow IPC stream for one channel, column name `y`. `write_end` closes the file. `read_values` is the inverse: native channel values, not the float64 dataset read. A `read` response still uses the counted multi-channel envelope. A `write_chunk` payload is the Arrow stream itself. Protocol version stays 1, so an older client that never sends these ops is unchanged. An older bridge answers `write_begin` with an unknown-op argument error.
+`write_begin`, `write_chunk`, and `write_end` are the export. `write_begin` names the path, mode (`create` or `append`), file properties, and groups. `write_chunk` carries one Arrow IPC stream for one channel, column name `y`. `write_end` closes the file. `read_values` is the inverse: native channel values, not the float64 dataset read. A `write_chunk` payload is the Arrow stream itself; requests are always single frames.
 
-`offset` and `limit` select a half-open sample range of the merged series, `[offset, offset+limit)`. Omit both for the full dataset read, which is unchanged. `limit` without `offset` is a prefix. `offset` without `limit` reads through the end. A time window together with a sample range is an error. The response adds `reads` and `limited`. `reads` lists each decoded slice: `file`, `group`, `name`, `role` (`data` or `timestamp`), `offset`, `length`, and `channel_samples`. `limited` is true when a sample range was applied. Clients that do not know these fields ignore them. A Python read that asked for a range and got `limited: false` raises `ProtocolError`, which is how an older bridge that ignored the fields is detected. Protocol version stays 1.
+`offset` and `limit` select a half-open sample range of the merged series, `[offset, offset+limit)`. Omit both for the full dataset read, which is unchanged. `limit` without `offset` is a prefix. `offset` without `limit` reads through the end. A time window together with a sample range is an error. The response adds `reads` and `limited`. `reads` lists each decoded slice: `file`, `group`, `name`, `role` (`data` or `timestamp`), `offset`, `length`, and `channel_samples`. `limited` is true when a sample range was applied. A Python read that asked for a range and got `limited: false` raises `ProtocolError`.
 
 ## Writing files
 

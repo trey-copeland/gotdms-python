@@ -68,7 +68,7 @@ frame = bundle.as_polars()
 
 The long npTDMS mapping, including the LGPL-3.0 and MIT license note, is [`docs/nptdms-migration.md`](docs/nptdms-migration.md). This project's own license is MIT (`LICENSE`).
 
-Python 3.10 or newer. The client and the bridge speak protocol version 1. That protocol number, not a core git tag, is the compatibility check between them.
+Python 3.10 or newer. The client and the bridge speak protocol version 2. That protocol number, not a core git tag, is the compatibility check between them. A version 1 bridge (from an older checkout, through `GOTDMS_BRIDGE`) is refused with a `ProtocolError` that says to rebuild it.
 
 This repository is [gotdms-python](https://github.com/trey-copeland/gotdms-python). The proposed PyPI distribution name is `gotdms`. The import package is `gotdms`. Nothing has been published to PyPI, and this repository has no release tag. `0.1.0` in `pyproject.toml` is the version recorded for that first release. It is not a tag.
 

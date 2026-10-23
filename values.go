@@ -14,7 +14,8 @@ import (
 //
 // Each channel is read with Channel.Values and encoded before the next one
 // is read, so the bridge holds one channel's decoded values at a time next
-// to the encoded parts. Group.Values would split a shared interleaved
+// to the encoded streams. The streams are sent as part frames, so the reply
+// has no size ceiling and is not joined into one buffer. Group.Values would split a shared interleaved
 // segment in one pass, but it holds every channel of the group at once:
 // about a third more peak memory for a few percent of speed. Channel.Values
 // places an interleaved channel that continues in a later segment at its
@@ -29,7 +30,7 @@ func readValues(path string) (any, []byte, error) {
 	}
 	defer f.Close()
 	groups := make([]map[string]any, 0, len(f.Groups()))
-	var parts [][]byte
+	var streams []outStream
 	for _, g := range f.Groups() {
 		channels := g.Channels()
 		chans := make([]map[string]any, 0, len(channels))
@@ -46,8 +47,8 @@ func readValues(path string) (any, []byte, error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			parts = append(parts, blob)
 			item := map[string]any{
+				"stream":     len(streams),
 				"name":       ch.Name(),
 				"type":       wire,
 				"ni_type":    ch.DataType().String(),
@@ -60,6 +61,7 @@ func readValues(path string) (any, []byte, error) {
 					item["digital"] = true
 				}
 			}
+			streams = append(streams, blobStream("values", blob))
 			chans = append(chans, item)
 		}
 		groups = append(groups, map[string]any{
@@ -69,12 +71,11 @@ func readValues(path string) (any, []byte, error) {
 		})
 	}
 	header := map[string]any{
-		"op":         "result",
 		"path":       path,
 		"properties": typedProps(f.Properties()),
 		"groups":     groups,
 	}
-	return header, joinPayload(parts), nil
+	return &dataResp{header: header, streams: streams}, nil, nil
 }
 
 func typedProps(props []tdms.Property) []map[string]any {

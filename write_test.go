@@ -492,17 +492,7 @@ func (c *client) callPayload(t *testing.T, header map[string]any, payload []byte
 	if err != nil {
 		t.Fatal(err)
 	}
-	var raw struct {
-		Op      string `json:"op"`
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
-	if len(f.Header) > 0 {
-		if err := json.Unmarshal(f.Header, &raw); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return reply{Op: raw.Op, Code: raw.Code, Message: raw.Message, Payload: f.Payload, Header: f.Header}
+	return c.finish(t, f)
 }
 
 func headerMap(t *testing.T, raw json.RawMessage) map[string]any {

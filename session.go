@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
 
 	"github.com/trey-copeland/gotdms"
 	"github.com/trey-copeland/gotdms/dataset"
@@ -16,7 +19,13 @@ import (
 // Serve reads protocol frames from r and writes responses to w until the
 // peer closes the input or sends close. One process holds one dataset.
 func Serve(r io.Reader, w io.Writer) error {
-	s := &session{}
+	return ServeParts(r, w, MaxPart)
+}
+
+// ServeParts is Serve with a smaller part-frame cap, for tests that want
+// many parts from small reads. A cap outside 1..MaxPart means MaxPart.
+func ServeParts(r io.Reader, w io.Writer, partCap int) error {
+	s := &session{partCap: partCap}
 	defer s.abortWrite()
 	for {
 		f, err := ReadFrame(r)
@@ -56,6 +65,12 @@ func Serve(r io.Reader, w io.Writer) error {
 			}
 			continue
 		}
+		if d, ok := header.(*dataResp); ok {
+			if err := writeData(w, s.partCap, d); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := writeResult(w, header, payload); err != nil {
 			return err
 		}
@@ -71,6 +86,7 @@ type session struct {
 	epochSet bool
 	overlap  dataset.OverlapPolicy
 	wr       *fileWrite
+	partCap  int
 }
 
 func (s *session) dispatch(op string, req map[string]json.RawMessage, payload []byte) (any, []byte, error) {
@@ -313,36 +329,125 @@ func (s *session) enrich(in []dataset.Occurrence) []channelJSON {
 	return out
 }
 
-func (s *session) readMany(sels []dataset.Selector, req map[string]json.RawMessage) ([]table, error) {
-	tables, _, _, err := s.readTables(sels, req)
-	return tables, err
+func (s *session) readMany(sels []dataset.Selector, req map[string]json.RawMessage) ([]*seriesEnc, error) {
+	encs, _, _, err := s.readTables(sels, req)
+	return encs, err
 }
 
-// finishRead packs channel tables and attaches the sample-range log.
-// reads lists channel slices this call decoded. limited is false for a
-// dataset read of the whole span. Old clients ignore both fields.
+// finishRead plans a data reply: one clock stream per distinct time axis,
+// then one stream per channel. reads lists channel slices this call
+// decoded. limited is false for a dataset read of the whole span.
 func (s *session) finishRead(sels []dataset.Selector, req map[string]json.RawMessage) (any, []byte, error) {
-	tables, reads, limited, err := s.readTables(sels, req)
+	encs, reads, limited, err := s.readTables(sels, req)
 	if err != nil {
 		return nil, nil, err
-	}
-	header, payload, err := packTables(tables)
-	if err != nil {
-		return nil, nil, err
-	}
-	h, ok := header.(map[string]any)
-	if !ok {
-		return nil, nil, errCode("error", "internal header type")
 	}
 	if reads == nil {
 		reads = []spanRead{}
 	}
-	h["reads"] = reads
-	h["limited"] = limited
-	return h, payload, nil
+	d, err := planRead(encs)
+	if err != nil {
+		return nil, nil, err
+	}
+	d.header["reads"] = reads
+	d.header["limited"] = limited
+	return d, nil, nil
 }
 
-func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMessage) ([]table, []spanRead, bool, error) {
+type clockOut struct {
+	ID      int `json:"id"`
+	Samples int `json:"samples"`
+	Stream  int `json:"stream"`
+}
+
+// clockSet gives each distinct time axis one id. Series that point to the
+// same dataset.Clock share without a comparison. Any other two axes share
+// only when their nanoseconds are equal element for element, so a shared id
+// is always proven, never assumed.
+type clockSet struct {
+	byPtr map[*dataset.Clock]int
+	byKey map[[3]int64][]int
+	ns    [][]int64
+}
+
+func (c *clockSet) id(e *seriesEnc) int {
+	if e.ser.Clock != nil {
+		if id, ok := c.byPtr[e.ser.Clock]; ok {
+			return id
+		}
+	}
+	ns := e.timeNs()
+	key := [3]int64{int64(len(ns))}
+	if len(ns) > 0 {
+		key[1], key[2] = ns[0], ns[len(ns)-1]
+	}
+	id := -1
+	for _, cand := range c.byKey[key] {
+		if slices.Equal(c.ns[cand], ns) {
+			id = cand
+			break
+		}
+	}
+	if id < 0 {
+		id = len(c.ns)
+		c.ns = append(c.ns, ns)
+		c.byKey[key] = append(c.byKey[key], id)
+	}
+	if e.ser.Clock != nil {
+		c.byPtr[e.ser.Clock] = id
+	}
+	return id
+}
+
+func planRead(encs []*seriesEnc) (*dataResp, error) {
+	clocks := &clockSet{byPtr: map[*dataset.Clock]int{}, byKey: map[[3]int64][]int{}}
+	clockOf := make([]int, len(encs))
+	for i, e := range encs {
+		clockOf[i] = -1
+		if e.cols.absolute && e.hasTimes() {
+			clockOf[i] = clocks.id(e)
+			if !e.cols.relative {
+				// The clock holds the nanoseconds now. Times are only needed
+				// again for relative_s.
+				e.ser.Times = nil
+			}
+		}
+	}
+	d := &dataResp{}
+	clockList := make([]clockOut, len(clocks.ns))
+	for id, ns := range clocks.ns {
+		ns := ns
+		st, err := recordStream("clock", func() (arrow.Record, error) {
+			return oneColumn("time_ns", viewArray(arrow.PrimitiveTypes.Int64, ns), nil), nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		clockList[id] = clockOut{ID: id, Samples: len(ns), Stream: len(d.streams)}
+		d.streams = append(d.streams, st)
+	}
+	metas := make([]channelOut, len(encs))
+	for i, e := range encs {
+		e := e
+		e.meta.Columns = columnNames(false, e.cols.relative)
+		if clockOf[i] >= 0 {
+			id := clockOf[i]
+			e.meta.Clock = &id
+		}
+		sid := len(d.streams)
+		e.meta.Stream = &sid
+		st, err := recordStream("channel", func() (arrow.Record, error) { return e.record(nil, false) })
+		if err != nil {
+			return nil, err
+		}
+		d.streams = append(d.streams, st)
+		metas[i] = e.meta
+	}
+	d.header = map[string]any{"channels": metas, "clocks": clockList}
+	return d, nil
+}
+
+func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMessage) ([]*seriesEnc, []spanRead, bool, error) {
 	if err := s.need(); err != nil {
 		return nil, nil, false, err
 	}
@@ -352,7 +457,9 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 	cols := columnSet{absolute: jsonBool(req, "absolute", true), relative: jsonBool(req, "relative", true)}
 	scaled := jsonBool(req, "scaled", false)
 	basis := s.ds.Basis()
-	var ro []dataset.ReadOption
+	// Series of one read that use the same clock share one []int64 of Unix
+	// nanoseconds instead of a []time.Time each.
+	ro := []dataset.ReadOption{dataset.WithSharedClock()}
 	if raw, ok := req["basis"]; ok && string(raw) != "null" {
 		t, err := parseTime(raw)
 		if err != nil {
@@ -401,7 +508,7 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 	if err != nil {
 		return nil, nil, limited, err
 	}
-	tables := make([]table, len(series))
+	encs := make([]*seriesEnc, len(series))
 	for i, ser := range series {
 		info, match, err := s.scaleFor(ser, scaled)
 		if err != nil {
@@ -411,12 +518,12 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 		if natives != nil {
 			nat = &natives[i]
 		}
-		tables[i], err = encodeSeries(ser, cols, info, scaled, match, nat)
+		encs[i], err = prepareSeries(ser, cols, info, scaled, match, nat)
 		if err != nil {
 			return nil, nil, limited, err
 		}
 	}
-	return tables, reads, limited, nil
+	return encs, reads, limited, nil
 }
 
 func (s *session) loadSeries(sels []dataset.Selector, start, end time.Time, window bool, ro []dataset.ReadOption) ([]dataset.Series, error) {
@@ -595,20 +702,6 @@ func (s *session) scaleFor(ser dataset.Series, scaled bool) (scaleInfo, bool, er
 		}
 	}
 	return info, propsMatch, nil
-}
-
-func packTables(tables []table) (any, []byte, error) {
-	metas := make([]channelOut, len(tables))
-	parts := make([][]byte, len(tables))
-	for i, t := range tables {
-		metas[i] = t.meta
-		parts[i] = t.ipc
-	}
-	header := map[string]any{"op": "result", "channels": metas}
-	if len(parts) == 0 {
-		return header, nil, nil
-	}
-	return header, joinPayload(parts), nil
 }
 
 func windowOf(req map[string]json.RawMessage) (time.Time, time.Time, bool, error) {

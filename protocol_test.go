@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -133,11 +134,12 @@ func TestProtocolRoundTrip(t *testing.T) {
 	if len(parts) != 2 || len(many.Read) != 2 {
 		t.Fatalf("read_many parts %d headers %d", len(parts), len(many.Read))
 	}
-	cols0, ns0, err := decodeIPC(parts[0])
+	cols0, _, err := decodeIPC(parts[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	cols1, ns1, err := decodeIPC(parts[1])
+	ns0, ns1 := many.Clocks[0], many.Clocks[1]
+	cols1, _, err := decodeIPC(parts[1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,6 +330,8 @@ type reply struct {
 	Payload     []byte
 	Closed      bool
 	Header      json.RawMessage
+	Clocks      [][]int64
+	Data        *v2Reply
 }
 
 func (c *client) call(t *testing.T, header map[string]any) reply {
@@ -348,6 +352,15 @@ func (c *client) callVersion(t *testing.T, version uint16, header map[string]any
 	if err != nil {
 		t.Fatal(err)
 	}
+	return c.finish(t, f)
+}
+
+// finish turns a reply frame into a reply. A v2 data reply is read to
+// result_end and presented as before: Op "result", Payload the channel
+// streams in the old counted envelope, Clocks each channel's nanoseconds.
+// A result_end error becomes an error reply.
+func (c *client) finish(t *testing.T, f Frame) reply {
+	t.Helper()
 	var raw struct {
 		Op          string          `json:"op"`
 		Code        string          `json:"code"`
@@ -368,8 +381,27 @@ func (c *client) callVersion(t *testing.T, version uint16, header map[string]any
 		Reads: raw.Reads, Limited: raw.Limited, SampleReads: raw.SampleReads,
 		Header: f.Header,
 	}
+	data := raw.Op == "result_begin"
+	if data {
+		v, err := readData(c.out, f.Header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Data = v
+		if e, ok := v.end["error"].(map[string]any); ok {
+			r.Op, r.Code, r.Message = "error", fmt.Sprint(e["code"]), fmt.Sprint(e["message"])
+			return r
+		}
+		parts, ns, err := v.legacy()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Op = "result"
+		r.Payload = joinPayload(parts)
+		r.Clocks = ns
+	}
 	if len(raw.Channels) > 0 && string(raw.Channels) != "null" {
-		if len(f.Payload) > 0 {
+		if data {
 			if err := json.Unmarshal(raw.Channels, &r.Read); err != nil {
 				t.Fatal(err)
 			}
@@ -392,11 +424,11 @@ func decodeOne(t *testing.T, r reply) (y []float64, ns []int64, rel []float64) {
 	if len(parts) != 1 {
 		t.Fatalf("parts %d", len(parts))
 	}
-	cols, ns, err := decodeIPC(parts[0])
+	cols, _, err := decodeIPC(parts[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cols["y"], ns, cols["relative_s"]
+	return cols["y"], r.Clocks[0], cols["relative_s"]
 }
 
 func floatEq(a, b []float64) bool {
