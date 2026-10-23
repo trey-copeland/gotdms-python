@@ -2,15 +2,14 @@ module github.com/trey-copeland/gotdms-python
 
 go 1.22.0
 
-// github.com/trey-copeland/gotdms v0.1.1 is commit
-// 7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8. v0.1.0 is
-// 622cb34bacb80fd810d46ee77183e2bae80bf52d. v0.1.1 fixes ReadValues and
-// Group.Values for interleaved channels that span more than one segment,
-// and writes segment-index sidecars as version 2. This module does not
-// build those sidecars. See EXTRACTION.md.
+// github.com/trey-copeland/gotdms v0.1.2 is commit
+// 8d2f134a160600c8a12b2076cc395c6b05c5c9e2. It skips bytes between the
+// object list and the raw-data offset, so a file with that metadata
+// padding opens. v0.1.1 is 7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8.
+// This module does not build segment-index sidecars. See EXTRACTION.md.
 require (
 	github.com/apache/arrow-go/v18 v18.0.0
-	github.com/trey-copeland/gotdms v0.1.1
+	github.com/trey-copeland/gotdms v0.1.2
 )
 
 require (
