@@ -7,8 +7,9 @@
 // inside frame payloads. They are not JSON and not base64. A data reply is
 // result_begin, part frames of at most MaxPart bytes, and result_end, so it
 // has no size ceiling, and the bridge writes each stream straight from the
-// series' slices without building the reply in memory. Each distinct time
-// axis is one clock stream; channels name their clock by id.
+// series' slices without building the reply in memory. Channels and clocks
+// are columns packed into few streams (see packStreams); each distinct time
+// axis is sent once, and channels name their clock by id.
 //
 // Batch conversion writes a directory bundle: manifest.json plus one Arrow
 // IPC stream per channel. The Python client turns those streams into Polars

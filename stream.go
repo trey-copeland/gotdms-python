@@ -23,15 +23,17 @@ type dataResp struct {
 }
 
 type outStream struct {
-	kind  string // "clock", "channel", or "values"
-	size  int64
-	write func(io.Writer) error
+	kind    string // "clock", "channel", or "values"
+	size    int64
+	batches int // record batches in the stream
+	write   func(io.Writer) error
 }
 
 type streamOut struct {
-	ID    int    `json:"id"`
-	Kind  string `json:"kind"`
-	Bytes int64  `json:"bytes"`
+	ID      int    `json:"id"`
+	Kind    string `json:"kind"`
+	Bytes   int64  `json:"bytes"`
+	Batches int    `json:"batches"`
 }
 
 // streamHook, when set by a test, runs before stream id is written. An error
@@ -61,7 +63,7 @@ func writeData(w io.Writer, partCap int, d *dataResp) error {
 	list := make([]streamOut, len(d.streams))
 	var total int64
 	for i, s := range d.streams {
-		list[i] = streamOut{ID: i, Kind: s.kind, Bytes: s.size}
+		list[i] = streamOut{ID: i, Kind: s.kind, Bytes: s.size, Batches: s.batches}
 		total += s.size
 	}
 	h["streams"] = list
@@ -129,8 +131,13 @@ func sendStream(w io.Writer, partCap, id int, s outStream) error {
 // straight from the caller's slice.
 const smallWrite = 64 << 10
 
+// stageCap is the size of partWriter's staging buffer. A batch of many short
+// channels is many small column writes; staging up to 1 MiB of them sends a
+// few parts instead of one per 64 KiB.
+const stageCap = 1 << 20
+
 // partWriter turns one Arrow IPC stream into part frames of at most cap
-// payload bytes. It never holds more than smallWrite bytes of its own.
+// payload bytes. It never holds more than stageCap bytes of its own.
 // A write that would take the stream past limit, its declared size, is
 // refused before any of it is sent: a client allocates exactly the declared
 // size, and bytes past it would desynchronize the pipe.
@@ -163,7 +170,7 @@ func (p *partWriter) Write(b []byte) (int, error) {
 		p.over = errCode("error", fmt.Sprintf("stream is longer than its declared %d bytes", p.limit))
 		return 0, p.over
 	}
-	if len(b) < smallWrite && len(p.buf)+len(b) <= smallWrite && len(p.buf)+len(b) <= p.cap {
+	if len(b) < smallWrite && len(p.buf)+len(b) <= stageCap && len(p.buf)+len(b) <= p.cap {
 		p.buf = append(p.buf, b...)
 		p.n += int64(n)
 		return n, nil
@@ -224,34 +231,9 @@ func writeRecord(w io.Writer, rec arrow.Record) error {
 	return iw.Close()
 }
 
-// recordStream is a stream whose record is built on demand: once to count
-// its bytes for result_begin and once to send it. Columns are views of the
-// series' slices, so building costs no copy unless a column is computed
-// (scaled values, relative time, converted timestamps).
-func recordStream(kind string, build func() (arrow.Record, error)) (outStream, error) {
-	rec, err := build()
-	if err != nil {
-		return outStream{}, err
-	}
-	var c countWriter
-	err = writeRecord(&c, rec)
-	rec.Release()
-	if err != nil {
-		return outStream{}, err
-	}
-	return outStream{kind: kind, size: c.n, write: func(w io.Writer) error {
-		rec, err := build()
-		if err != nil {
-			return err
-		}
-		defer rec.Release()
-		return writeRecord(w, rec)
-	}}, nil
-}
-
-// blobStream sends bytes that are already encoded.
+// blobStream sends bytes that are already encoded, as one batch.
 func blobStream(kind string, blob []byte) outStream {
-	return outStream{kind: kind, size: int64(len(blob)), write: func(w io.Writer) error {
+	return outStream{kind: kind, size: int64(len(blob)), batches: 1, write: func(w io.Writer) error {
 		_, err := w.Write(blob)
 		return err
 	}}
@@ -274,11 +256,4 @@ func viewArray[T any](dt arrow.DataType, vals []T) arrow.Array {
 	data := array.NewData(dt, len(vals), []*memory.Buffer{nil, buf}, nil, 0, 0)
 	defer data.Release()
 	return array.MakeFromData(data)
-}
-
-// oneColumn is a record with a single non-nullable column.
-func oneColumn(name string, col arrow.Array, md *arrow.Metadata) arrow.Record {
-	defer col.Release()
-	schema := arrow.NewSchema([]arrow.Field{{Name: name, Type: col.DataType(), Nullable: false}}, md)
-	return array.NewRecord(schema, []arrow.Array{col}, int64(col.Len()))
 }

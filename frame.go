@@ -49,9 +49,11 @@ const MaxPart = 64 << 20
 //
 // No stream gets more bytes than result_begin declared for it, even when it
 // fails. After a result_end with an error the session is still usable; the
-// client drops the partial streams. A clock stream has one int64 column time_ns. A
-// channel stream has y, plus relative_s when asked for, and names its clock
-// by id in the result_begin channel list.
+// client drops the partial streams. Each stream has one schema and the
+// number of record batches result_begin declares for it. Channels and clocks
+// are columns: result_begin names each one's stream, batch, and column (and
+// a channel's relative_s column when asked for). A clock column is int64
+// time_ns. See packStreams for how columns are packed into streams.
 //
 // write_chunk carries one Arrow IPC stream for one channel as its payload.
 // Requests are always single frames.

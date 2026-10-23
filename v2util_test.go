@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 )
@@ -25,11 +26,62 @@ type v2Reply struct {
 
 type beginHeader struct {
 	Channels []struct {
-		Clock  *int `json:"clock"`
-		Stream *int `json:"stream"`
+		Clock     *int `json:"clock"`
+		Stream    *int `json:"stream"`
+		Batch     *int `json:"batch"`
+		Column    *int `json:"column"`
+		RelColumn *int `json:"relative_column"`
 	} `json:"channels"`
+	Groups []struct {
+		Channels []colRef `json:"channels"`
+	} `json:"groups"`
 	Clocks  []clockOut  `json:"clocks"`
 	Streams []streamOut `json:"streams"`
+}
+
+// batchesOf decodes every record batch of one stream and checks the count
+// against result_begin.
+func batchesOf(blob []byte, want int) ([]arrow.Record, error) {
+	r, err := ipc.NewReader(bytes.NewReader(blob))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Release()
+	var out []arrow.Record
+	for r.Next() {
+		rec := r.Record()
+		rec.Retain()
+		out = append(out, rec)
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) != want {
+		return nil, fmt.Errorf("stream has %d batches, declared %d", len(out), want)
+	}
+	return out, nil
+}
+
+// columnStream re-encodes columns of one batch as a single-batch stream
+// named names, so per-channel assertions read one stream per channel.
+func columnStream(rec arrow.Record, cols []int, names []string) ([]byte, error) {
+	fields := make([]arrow.Field, len(cols))
+	arrs := make([]arrow.Array, len(cols))
+	for i, c := range cols {
+		if c < 0 || c >= int(rec.NumCols()) {
+			return nil, fmt.Errorf("column %d of %d", c, rec.NumCols())
+		}
+		f := rec.Schema().Field(c)
+		fields[i] = arrow.Field{Name: names[i], Type: f.Type, Nullable: f.Nullable}
+		arrs[i] = rec.Column(c)
+	}
+	out := array.NewRecord(arrow.NewSchema(fields, nil), arrs, rec.NumRows())
+	defer out.Release()
+	var buf bytes.Buffer
+	if err := writeRecord(&buf, out); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // readData reads the frames after a result_begin header. It returns an
@@ -101,35 +153,98 @@ func readData(r io.Reader, begin json.RawMessage) (*v2Reply, error) {
 	}
 }
 
-// legacy returns, per channel in header order, its own stream and its clock
-// nanoseconds (nil when it has no clock).
+// legacy returns, per channel in header order, the channel's columns
+// re-encoded as a stream of its own (y, plus relative_s when sent) and its
+// clock nanoseconds (nil when it has no clock). For read_values the
+// channels are in group order. Every column of every stream must be named
+// by exactly one channel or clock.
 func (v *v2Reply) legacy() ([][]byte, [][]int64, error) {
 	var h beginHeader
 	if err := json.Unmarshal(v.begin, &h); err != nil {
 		return nil, nil, err
 	}
+	recs := make([][]arrow.Record, len(v.streams))
+	total := 0
+	for i, blob := range v.streams {
+		got, err := batchesOf(blob, h.Streams[i].Batches)
+		if err != nil {
+			return nil, nil, fmt.Errorf("stream %d: %w", i, err)
+		}
+		for _, r := range got {
+			total += int(r.NumCols())
+		}
+		recs[i] = got
+	}
+	used := map[colRef]bool{}
+	take := func(ref colRef, kind string) (arrow.Record, error) {
+		if ref.Stream < 0 || ref.Stream >= len(recs) || h.Streams[ref.Stream].Kind != kind {
+			return nil, fmt.Errorf("ref %+v is not a %s stream", ref, kind)
+		}
+		if ref.Batch < 0 || ref.Batch >= len(recs[ref.Stream]) {
+			return nil, fmt.Errorf("ref %+v: no such batch", ref)
+		}
+		if used[ref] {
+			return nil, fmt.Errorf("ref %+v named twice", ref)
+		}
+		used[ref] = true
+		return recs[ref.Stream][ref.Batch], nil
+	}
 	if len(h.Channels) == 0 {
-		// read_values lists streams in group order, not channels.
-		return v.streams, nil, nil
+		var parts [][]byte
+		for _, g := range h.Groups {
+			for _, ref := range g.Channels {
+				rec, err := take(ref, "values")
+				if err != nil {
+					return nil, nil, err
+				}
+				blob, err := columnStream(rec, []int{ref.Column}, []string{"y"})
+				if err != nil {
+					return nil, nil, err
+				}
+				parts = append(parts, blob)
+			}
+		}
+		if len(used) != total {
+			return nil, nil, fmt.Errorf("%d columns, %d named", total, len(used))
+		}
+		return parts, nil, nil
 	}
 	clocks := map[int][]int64{}
 	for _, c := range h.Clocks {
-		cols, ns, err := decodeIPC(v.streams[c.Stream])
+		ref := colRef{Stream: c.Stream, Batch: c.Batch, Column: c.Column}
+		rec, err := take(ref, "clock")
 		if err != nil {
 			return nil, nil, err
 		}
-		if len(cols) != 1 || ns == nil || len(ns) != c.Samples {
-			return nil, nil, fmt.Errorf("clock %d: %d columns, %d samples", c.ID, len(cols), len(ns))
+		col, ok := rec.Column(c.Column).(*array.Int64)
+		if !ok || col.Len() != c.Samples {
+			return nil, nil, fmt.Errorf("clock %d: %T of %d samples", c.ID, rec.Column(c.Column), rec.Column(c.Column).Len())
 		}
-		clocks[c.ID] = ns
+		clocks[c.ID] = append([]int64(nil), col.Int64Values()...)
 	}
 	parts := make([][]byte, len(h.Channels))
 	ns := make([][]int64, len(h.Channels))
 	for i, ch := range h.Channels {
-		if ch.Stream == nil {
-			return nil, nil, fmt.Errorf("channel %d has no stream", i)
+		if ch.Stream == nil || ch.Batch == nil || ch.Column == nil {
+			return nil, nil, fmt.Errorf("channel %d has no column", i)
 		}
-		parts[i] = v.streams[*ch.Stream]
+		ref := colRef{Stream: *ch.Stream, Batch: *ch.Batch, Column: *ch.Column}
+		rec, err := take(ref, "channel")
+		if err != nil {
+			return nil, nil, err
+		}
+		cols, names := []int{ref.Column}, []string{"y"}
+		if ch.RelColumn != nil {
+			rref := ref
+			rref.Column = *ch.RelColumn
+			if _, err := take(rref, "channel"); err != nil {
+				return nil, nil, err
+			}
+			cols, names = append(cols, *ch.RelColumn), append(names, "relative_s")
+		}
+		if parts[i], err = columnStream(rec, cols, names); err != nil {
+			return nil, nil, err
+		}
 		if ch.Clock != nil {
 			c, ok := clocks[*ch.Clock]
 			if !ok {
@@ -137,6 +252,9 @@ func (v *v2Reply) legacy() ([][]byte, [][]int64, error) {
 			}
 			ns[i] = c
 		}
+	}
+	if len(used) != total {
+		return nil, nil, fmt.Errorf("%d columns, %d named", total, len(used))
 	}
 	return parts, ns, nil
 }
@@ -181,8 +299,8 @@ func SplitPayload(payload []byte) ([][]byte, error) {
 	return out, nil
 }
 
-// respPayload sends a dataResp through writeData and returns its streams
-// joined as the old envelope.
+// respPayload sends a dataResp through writeData and returns its channels
+// (see legacy) joined as the old envelope.
 func respPayload(d any) (map[string]any, []byte, error) {
 	resp, ok := d.(*dataResp)
 	if !ok {
@@ -203,7 +321,11 @@ func respPayload(d any) (map[string]any, []byte, error) {
 	if v.end["error"] != nil {
 		return nil, nil, fmt.Errorf("result_end error %v", v.end["error"])
 	}
-	return resp.header, joinPayload(v.streams), nil
+	parts, _, err := v.legacy()
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp.header, joinPayload(parts), nil
 }
 
 func decodeIPC(blob []byte) (map[string][]float64, []int64, error) {

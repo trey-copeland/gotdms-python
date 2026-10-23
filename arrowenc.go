@@ -45,8 +45,14 @@ type channelOut struct {
 	// absent for an untimed channel and when absolute time was not asked
 	// for. Stream is the channel's stream id. Bundles have neither: each
 	// bundle file carries its own time_ns column.
-	Clock  *int `json:"clock,omitempty"`
-	Stream *int `json:"stream,omitempty"`
+	Clock *int `json:"clock,omitempty"`
+	// Stream, Batch, and Column locate y in the reply: stream id, record
+	// batch within that stream, and column within that batch. RelColumn
+	// is relative_s in the same batch when it was asked for.
+	Stream    *int `json:"stream,omitempty"`
+	Batch     *int `json:"batch,omitempty"`
+	Column    *int `json:"column,omitempty"`
+	RelColumn *int `json:"relative_column,omitempty"`
 }
 
 type scaleOut struct {
@@ -163,6 +169,38 @@ func (e *seriesEnc) yArray() (arrow.Array, error) {
 		return viewArray(arrow.PrimitiveTypes.Float64, vals), nil
 	}
 	return viewArray(arrow.PrimitiveTypes.Float64, e.ser.Y), nil
+}
+
+// yType is the Arrow type yArray returns.
+func (e *seriesEnc) yType() arrow.DataType {
+	if e.useNative {
+		return arrowOf(e.nat.dt)
+	}
+	return arrow.PrimitiveTypes.Float64
+}
+
+// packItem is the channel's columns for a read reply: y, then relative_s
+// when asked for. Time is sent in clock streams.
+func (e *seriesEnc) packItem() *packItem {
+	rows := len(e.ser.Y)
+	typ := e.yType()
+	width := int64(8)
+	if fw, ok := typ.(arrow.FixedWidthDataType); ok {
+		width = int64(fw.BitWidth()+7) / 8
+	}
+	it := &packItem{rows: rows, bytes: int64(rows) * width}
+	it.cols = append(it.cols, packCol{base: "y", typ: typ, build: e.yArray})
+	if e.cols.relative {
+		it.bytes += int64(rows) * 8
+		it.cols = append(it.cols, packCol{base: "relative_s", typ: arrow.PrimitiveTypes.Float64, build: func() (arrow.Array, error) {
+			rel := e.ser.RelativeTimes()
+			if len(rel) != len(e.ser.Y) {
+				return nil, fmt.Errorf("bridge: relative time length %d, samples %d", len(rel), len(e.ser.Y))
+			}
+			return viewArray(arrow.PrimitiveTypes.Float64, rel), nil
+		}})
+	}
+	return it
 }
 
 // record is the channel's Arrow record: y, then time_ns when timeNs is not

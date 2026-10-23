@@ -145,17 +145,24 @@ func TestV2SharedClockMapping(t *testing.T) {
 	if ids[4] == nil || *ids[4] == *ids[2] || ids[5] != nil {
 		t.Fatalf("slow/untimed clocks %v %v", ids[4], ids[5])
 	}
-	if len(h.Clocks) != 3 || len(h.Streams) != 3+len(v2Sels) {
-		t.Fatalf("clocks %+v streams %d", h.Clocks, len(h.Streams))
+	// The three clocks have the same length, so they are three columns of
+	// one clock batch; clock streams come before channel streams, and the
+	// six channels need fewer streams than channels.
+	if len(h.Clocks) != 3 || h.Streams[0].Kind != "clock" || h.Streams[0].Batches != 1 {
+		t.Fatalf("clocks %+v streams %+v", h.Clocks, h.Streams)
 	}
-	for i, s := range h.Streams {
-		want := "channel"
-		if i < 3 {
-			want = "clock"
+	for i, c := range h.Clocks {
+		if c.Stream != 0 || c.Batch != 0 || c.Column != i {
+			t.Fatalf("clock %d at %+v", i, c)
 		}
-		if s.Kind != want {
-			t.Fatalf("stream %d kind %s", i, s.Kind)
+	}
+	for i, s := range h.Streams[1:] {
+		if s.Kind != "channel" {
+			t.Fatalf("stream %d kind %s", i+1, s.Kind)
 		}
+	}
+	if n := len(h.Streams) - 1; n >= len(v2Sels) {
+		t.Fatalf("%d channel streams for %d channels", n, len(v2Sels))
 	}
 	if !r.Read[5].AbsoluteOmitted || r.Read[5].Clock != nil {
 		t.Fatalf("untimed meta %+v", r.Read[5])
@@ -184,8 +191,8 @@ func TestV2SharedClockMapping(t *testing.T) {
 	if err := json.Unmarshal(rel.Header, &h); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.Clocks) != 0 || len(h.Streams) != len(v2Sels) {
-		t.Fatalf("relative read clocks %+v", h.Clocks)
+	if len(h.Clocks) != 0 || len(h.Streams) == 0 || len(h.Streams) >= len(v2Sels) {
+		t.Fatalf("relative read clocks %+v streams %+v", h.Clocks, h.Streams)
 	}
 	for i, id := range clockIDs(t, rel) {
 		if id != nil {
@@ -242,7 +249,7 @@ func TestPartWriterFrames(t *testing.T) {
 			if _, err := pw.Write(b); err != nil {
 				t.Fatal(err)
 			}
-			if len(pw.buf) > smallWrite || len(pw.buf) > cap {
+			if len(pw.buf) > stageCap || len(pw.buf) > cap {
 				t.Fatalf("cap %d: staged %d bytes", cap, len(pw.buf))
 			}
 			want = append(want, b...)
@@ -402,8 +409,15 @@ func TestV2EmptyAndValuesReplies(t *testing.T) {
 	}
 	h := headerMap(t, got.Header)
 	ch := h["groups"].([]any)[0].(map[string]any)["channels"].([]any)
-	if ch[2].(map[string]any)["stream"] != float64(2) {
-		t.Fatalf("stream index %v", ch[2])
+	// Every channel names a values stream, batch, and column; legacy
+	// (through c.call) already checked that each column is named once.
+	for i, x := range ch {
+		m := x.(map[string]any)
+		for _, k := range []string{"stream", "batch", "column"} {
+			if _, ok := m[k].(float64); !ok {
+				t.Fatalf("channel %d has no %s: %v", i, k, m)
+			}
+		}
 	}
 }
 
