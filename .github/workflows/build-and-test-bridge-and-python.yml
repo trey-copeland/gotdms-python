@@ -78,7 +78,8 @@ jobs:
         # nptdms is LGPL-3.0-only. CI uses it as a reader of files this
         # package wrote. It is not a runtime dependency and it is not shipped.
         # It is pinned so a new npTDMS release cannot fail CI by itself.
-        run: python -m pip install numpy pyarrow polars nptdms==1.13.0
+        # tzdata is a runtime dependency on Windows (see pyproject.toml).
+        run: python -m pip install numpy pyarrow polars "tzdata; sys_platform == 'win32'" nptdms==1.13.0
 
       - name: Python unit tests
         if: matrix.python
@@ -106,7 +107,8 @@ jobs:
 
       - name: Install the minimum supported dependencies
         # nptdms is LGPL-3.0-only and is the CI-only oracle, as above.
-        run: python -m pip install "numpy==1.26.0" "pyarrow==14.0.0" "polars==2.0.0" "nptdms==1.13.0"
+        # tzdata (Windows only, no version floor) is skipped on this Linux job.
+        run: python -m pip install "numpy==1.26.0" "pyarrow==14.0.0" "polars==2.0.0" "tzdata; sys_platform == 'win32'" "nptdms==1.13.0"
 
       - name: Show installed versions
         run: python -c "import sys, numpy, pyarrow, polars; print(sys.version); print('numpy', numpy.__version__, 'pyarrow', pyarrow.__version__, 'polars', polars.__version__)"
@@ -141,7 +143,8 @@ jobs:
         # nptdms is LGPL-3.0-only. CI uses it as a reader of files this
         # package wrote. It is not a runtime dependency and it is not shipped.
         # It is pinned so a new npTDMS release cannot fail CI by itself.
-        run: python -m pip install numpy pyarrow polars nptdms==1.13.0
+        # tzdata is a runtime dependency on Windows (see pyproject.toml).
+        run: python -m pip install numpy pyarrow polars "tzdata; sys_platform == 'win32'" nptdms==1.13.0
 
       - name: Python unit tests
         run: python -m unittest discover -s python/tests

@@ -32,5 +32,6 @@ Recorded from the distributions installed in the packaging environment. Classifi
 | polars | 2.0.0 | >=3.10 | MIT. Metadata `License` is the MIT text. https://github.com/pola-rs/polars |
 | polars-runtime-32 | 2.0.0 | (pulled by polars) | Classifier `License :: OSI Approved :: MIT License`. This is the Rust runtime wheel Polars depends on. It is not copied into the gotdms wheel. |
 | pyarrow | 18.1.0 | >=3.9 | Apache-2.0. Metadata `License` is `Apache Software License`. |
+| tzdata | 2026.5 | >=2 | Apache-2.0. Metadata `License` is `Apache-2.0`. Windows only (`sys_platform == 'win32'`): the IANA time zone database for Python's `zoneinfo`, which Polars needs to turn `Datetime("ns", "UTC")` values into Python datetimes. https://github.com/python/tzdata |
 
-This package depends on `numpy>=1.26`, `polars>=2`, and `pyarrow>=14`, and sets `requires-python` to `>=3.10` because Polars 2.0 does. `scan_tdms` uses `polars.io.plugins.register_io_source` from that release. Polars' pandas extra is not used.
+This package depends on `numpy>=1.26`, `polars>=2`, and `pyarrow>=14`, and on Windows also `tzdata` (no version floor; every release has `UTC`), and sets `requires-python` to `>=3.10` because Polars 2.0 does. `scan_tdms` uses `polars.io.plugins.register_io_source` from that release. Polars' pandas extra is not used.
