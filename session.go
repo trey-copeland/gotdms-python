@@ -460,6 +460,12 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 	// Series of one read that use the same clock share one []int64 of Unix
 	// nanoseconds instead of a []time.Time each.
 	ro := []dataset.ReadOption{dataset.WithSharedClock()}
+	// A reply with neither absolute nor relative time sends only y, so the
+	// read builds no time axis at all.
+	valuesOnly := !cols.absolute && !cols.relative
+	if valuesOnly {
+		ro = append(ro, dataset.WithoutTimes())
+	}
 	if raw, ok := req["basis"]; ok && string(raw) != "null" {
 		t, err := parseTime(raw)
 		if err != nil {
@@ -508,8 +514,17 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 	if err != nil {
 		return nil, nil, limited, err
 	}
+	if seriesHook != nil {
+		seriesHook(series)
+	}
 	encs := make([]*seriesEnc, len(series))
-	for i, ser := range series {
+	for i := range series {
+		if valuesOnly {
+			// Offset/limit and DAQmx reads still build times to order merged
+			// samples. The reply sends none, so drop them before streaming.
+			series[i].Times, series[i].Clock = nil, nil
+		}
+		ser := series[i]
 		info, match, err := s.scaleFor(ser, scaled)
 		if err != nil {
 			return nil, nil, limited, err
@@ -525,6 +540,9 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 	}
 	return encs, reads, limited, nil
 }
+
+// seriesHook sees each read's series before they are encoded. Tests only.
+var seriesHook func([]dataset.Series)
 
 func (s *session) loadSeries(sels []dataset.Selector, start, end time.Time, window bool, ro []dataset.ReadOption) ([]dataset.Series, error) {
 	if window {
