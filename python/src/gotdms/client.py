@@ -1,8 +1,10 @@
 """Long-lived client for the gotdms-bridge ``serve`` process.
 
 One process, one open dataset, many reads. Each request is one frame and
-each response is one frame, so a shared timestamp clock is decoded in the
-dataset layer and returned once. This module does not import npTDMS.
+each response is one frame. Channels that share a timestamp channel share
+one clock decode in the dataset layer, but each channel's Arrow stream
+still carries its own copy of the time columns. This module does not
+import npTDMS.
 """
 
 from __future__ import annotations
@@ -10,13 +12,16 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ._process import StderrTail, shutdown, start_drain
 from .codec import as_polars, series_from_parts, split_payload, write_frame, read_frame
 from .errors import (
     AmbiguousChannelError,
     ArgumentError,
+    CorruptFileError,
     GotdmsError,
     MonotonicError,
     NoFilesError,
@@ -31,6 +36,7 @@ from .errors import (
 
 _CODE_TYPES = {
     "argument": ArgumentError,
+    "corrupt": CorruptFileError,
     "untimed": UntimedError,
     "not_found": NotFoundError,
     "no_files": NoFilesError,
@@ -91,6 +97,10 @@ class Session:
 
     The binary is not safe to share across threads. This class locks the
     pipe so one session is still safe to call from several threads.
+
+    Prefer :meth:`close` or a ``with`` block. A session that is dropped
+    without either still stops its bridge process when it is garbage
+    collected, or at interpreter exit at the latest.
     """
 
     def __init__(self, binary=None):
@@ -104,24 +114,13 @@ class Session:
             bufsize=0,
         )
         self._lock = threading.Lock()
-        self._stderr = bytearray()
-        self._drain = threading.Thread(target=self._read_stderr, name="gotdms-bridge-stderr", daemon=True)
-        self._drain.start()
+        # The drain thread and the finalizer hold the process and the tail,
+        # not self, so an unclosed session can still be collected.
+        self._stderr = StderrTail()
+        self._drain = start_drain(self._proc, self._stderr)
+        self._finalizer = weakref.finalize(self, shutdown, self._proc, self._lock)
         self._catalog = None
         self._closed = False
-
-    def _read_stderr(self):
-        stream = self._proc.stderr
-        if stream is None:
-            return
-        try:
-            while True:
-                chunk = stream.read(4096)
-                if not chunk:
-                    return
-                self._stderr += chunk
-        except Exception:
-            return
 
     def __enter__(self):
         return self
@@ -136,25 +135,10 @@ class Session:
             if self._closed:
                 return
             self._closed = True
-            try:
-                if self._proc.poll() is None and self._proc.stdin is not None:
-                    write_frame(self._proc.stdin, {"op": "close"})
-                    read_frame(self._proc.stdout)
-            except Exception:
-                pass
-            finally:
-                for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
-                    if stream is None:
-                        continue
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-                try:
-                    self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-                    self._proc.wait(timeout=5)
+            # The lock is already held, so stop the finalizer and shut down
+            # here without it. detach() returns None if it already ran.
+            if self._finalizer.detach() is not None:
+                shutdown(self._proc)
 
     def open(
         self,
@@ -500,7 +484,7 @@ class Session:
         return decoded, payload
 
     def _dead_message(self) -> str:
-        err = bytes(self._stderr).decode(errors="replace").strip()
+        err = self._stderr.text()
         if err:
             return err
         return f"gotdms-bridge exited {self._proc.returncode}"

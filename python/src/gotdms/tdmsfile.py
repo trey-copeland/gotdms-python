@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import io
 import subprocess
-import threading
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
+from ._process import StderrTail, shutdown, start_drain
 from .client import _raise_protocol, locate_binary
 from .codec import read_frame, split_payload, write_frame
 from .errors import ArgumentError, ProtocolError
@@ -769,8 +770,10 @@ def _datetime_from_wire(text):
         while i < len(text) and text[i].isdigit():
             i += 1
         digits = text[dot + 1 : i]
-        if len(digits) > 6:
-            text = text[: dot + 1] + digits[:6] + text[i:]
+        # Python 3.10 fromisoformat accepts only 3 or 6 fraction digits, so
+        # pad a shorter fraction (".25") and truncate a longer one to 6.
+        if digits and len(digits) != 6:
+            text = text[: dot + 1] + digits[:6].ljust(6, "0") + text[i:]
     return datetime.fromisoformat(text)
 
 
@@ -786,23 +789,10 @@ class _Bridge:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        self._stderr = bytearray()
-        self._drain = threading.Thread(target=self._read_stderr, name="gotdms-bridge-stderr", daemon=True)
-        self._drain.start()
+        self._stderr = StderrTail()
+        self._drain = start_drain(self._proc, self._stderr)
+        self._finalizer = weakref.finalize(self, shutdown, self._proc)
         self._closed = False
-
-    def _read_stderr(self):
-        stream = self._proc.stderr
-        if stream is None:
-            return
-        try:
-            while True:
-                chunk = stream.read(4096)
-                if not chunk:
-                    return
-                self._stderr += chunk
-        except Exception:
-            return
 
     def __enter__(self):
         return self
@@ -829,28 +819,10 @@ class _Bridge:
         if self._closed:
             return
         self._closed = True
-        try:
-            if self._proc.poll() is None and self._proc.stdin is not None:
-                write_frame(self._proc.stdin, {"op": "close"})
-                read_frame(self._proc.stdout)
-        except Exception:
-            pass
-        finally:
-            for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
-                if stream is None:
-                    continue
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait(timeout=5)
+        self._finalizer()
 
     def _dead(self):
-        err = bytes(self._stderr).decode(errors="replace").strip()
+        err = self._stderr.text()
         if err:
             return err
         return f"gotdms-bridge exited {self._proc.returncode}"

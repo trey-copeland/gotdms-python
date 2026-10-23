@@ -264,7 +264,7 @@ class WriteTest(unittest.TestCase):
 
         junk = self.path("junk.tdms")
         Path(junk).write_bytes(b"this is not a tdms file")
-        with self.assertRaises(gotdms.ArgumentError):
+        with self.assertRaises(gotdms.CorruptFileError):
             gotdms.write_tdms(junk, frame, mode="append")
         self.assertEqual(Path(junk).read_bytes(), b"this is not a tdms file")
 

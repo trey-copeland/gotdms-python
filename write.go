@@ -874,15 +874,14 @@ func asArg(err error) error {
 	if errors.Is(err, os.ErrNotExist) {
 		return errCode("argument", err.Error())
 	}
+	if isCorrupt(err) {
+		return errCode("corrupt", err.Error())
+	}
 	switch {
 	case errors.Is(err, tdms.ErrArgument),
 		errors.Is(err, tdms.ErrType),
 		errors.Is(err, tdms.ErrUnsupported),
-		errors.Is(err, tdms.ErrLayout),
-		errors.Is(err, tdms.ErrBadTag),
-		errors.Is(err, tdms.ErrCorrupt),
-		errors.Is(err, tdms.ErrVersion),
-		errors.Is(err, tdms.ErrTruncated):
+		errors.Is(err, tdms.ErrLayout):
 		return errCode("argument", err.Error())
 	default:
 		return err

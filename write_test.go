@@ -361,8 +361,23 @@ func TestWriteAppendAndReject(t *testing.T) {
 		"op": "write_begin", "path": bad, "mode": "append",
 		"groups": []map[string]any{{"name": "data", "channels": []map[string]any{chSpec("ai0", "float64", 1, nil, nil)}}},
 	}, nil)
-	if junk.Code != "argument" {
+	if junk.Code != "corrupt" {
 		t.Fatalf("junk append: %+v", junk)
+	}
+	// The same bad file is "corrupt" from open and read_values too.
+	for _, op := range []string{"open", "describe", "read_values"} {
+		got := c.callPayload(t, map[string]any{"op": op, "paths": []string{bad}, "path": bad}, nil)
+		if got.Code != "corrupt" {
+			t.Fatalf("%s of a junk file: %+v", op, got)
+		}
+	}
+	// A missing path is the caller's mistake from every op.
+	gone := filepath.Join(dir, "gone.tdms")
+	for _, op := range []string{"open", "describe", "read_values"} {
+		got := c.callPayload(t, map[string]any{"op": op, "paths": []string{gone}, "path": gone}, nil)
+		if got.Code != "argument" {
+			t.Fatalf("%s of a missing file: %+v", op, got)
+		}
 	}
 
 	inc := filepath.Join(dir, "partial.tdms")
