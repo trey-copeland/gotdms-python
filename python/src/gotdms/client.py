@@ -81,10 +81,11 @@ def locate_binary(explicit=None) -> str:
     if bundled:
         return bundled
     raise GotdmsError(
-        "gotdms-bridge was not found. Install a platform wheel so the binary "
-        "is bundled (`pip install gotdms`), or set GOTDMS_BRIDGE to a binary "
-        "from `go build -o gotdms-bridge ./cmd/gotdms-bridge` in the "
-        "gotdms-python source tree (Go required). Protocol version 2."
+        "gotdms-bridge was not found. The package is not on PyPI yet: run "
+        "`pip install .` in a gotdms-python checkout to build a wheel with "
+        "the binary bundled (Go required), or set GOTDMS_BRIDGE to a binary "
+        "from `go build -o gotdms-bridge ./cmd/gotdms-bridge` in that "
+        "source tree. Protocol version 2."
     )
 
 
