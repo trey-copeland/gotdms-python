@@ -100,6 +100,19 @@ def shutdown(proc: subprocess.Popen, lock=None) -> None:
             lock.release()
 
 
+def kill(proc: subprocess.Popen) -> None:
+    """Kill a bridge whose pipe is out of sync, then reap it and close pipes.
+
+    A bridge that is mid-reply may be blocked writing to a full stdout pipe,
+    so closing its stdin would not stop it.
+    """
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    _stop(proc, polite=False)
+
+
 def _stop(proc: subprocess.Popen, polite: bool) -> None:
     try:
         if polite and proc.poll() is None and proc.stdin is not None:

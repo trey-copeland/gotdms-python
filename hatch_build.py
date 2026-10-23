@@ -7,7 +7,7 @@ plus GOOS and GOARCH. A source install with those unset tags the wheel for
 the host (linux/amd64 -> manylinux_2_17_x86_64, and the four other pairs
 .github/workflows/build-and-publish-python-package.yml builds). CGO_ENABLED=0.
 
-go.mod requires github.com/trey-copeland/gotdms v0.1.2. ``go build``
+go.mod requires github.com/trey-copeland/gotdms v0.2.0. ``go build``
 downloads that module.
 This hook does not rewrite go.mod and does not vendor a third_party/gotdms
 tree. That vendoring belonged to the in-tree bridge, whose only core
@@ -36,14 +36,16 @@ _HOST_TAGS = {
 
 class CustomBuildHook(BuildHookInterface):
     def initialize(self, version, build_data):
+        if self.target_name not in ("sdist", "wheel"):
+            return
+        root = Path(self.root)
+        # Both targets: an sdist ships go.mod, so a local replace in it would
+        # make every source install fail or build from someone's checkout.
+        self._reject_parent_replace(root)
         if self.target_name == "sdist":
             # The sdist ships go.mod and go.sum. A source install resolves
             # gotdms from those files. Nothing is copied from a parent checkout.
             return
-        if self.target_name != "wheel":
-            return
-        root = Path(self.root)
-        self._reject_parent_replace(root)
         binary = self._build_binary(root)
         name = binary.name
         build_data.setdefault("force_include", {})
@@ -64,6 +66,9 @@ class CustomBuildHook(BuildHookInterface):
         dest = dest_dir / name
         env = os.environ.copy()
         env["CGO_ENABLED"] = "0"
+        # A go.work above the checkout could swap in a local gotdms that the
+        # go.mod check below never sees. Packages build from go.mod alone.
+        env["GOWORK"] = "off"
         subprocess.check_call(
             ["go", "build", "-trimpath", "-o", str(dest), "./cmd/gotdms-bridge"],
             cwd=root,
@@ -73,18 +78,68 @@ class CustomBuildHook(BuildHookInterface):
         return dest
 
     def _reject_parent_replace(self, root: Path) -> None:
-        text = (root / "go.mod").read_text(encoding="utf-8")
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("replace "):
+        target = local_gotdms_replace((root / "go.mod").read_text(encoding="utf-8"))
+        if target is None:
+            return
+        if target in {"../", ".."}:
+            raise RuntimeError(
+                "go.mod still replaces gotdms with ../. "
+                "This repository requires a module version instead."
+            )
+        # A local directory (the development replace used until a core tag
+        # exists) would build a package from unreleased, unrecorded source.
+        raise RuntimeError(
+            f"go.mod replaces gotdms with the local directory {target}. "
+            "That replace is for development only; pin a gotdms version before building a package."
+        )
+
+
+_GOTDMS = "github.com/trey-copeland/gotdms"
+
+
+def local_gotdms_replace(gomod: str):
+    """The local directory go.mod replaces the gotdms core with, or None.
+
+    Reads both ``replace a => b`` lines and ``replace ( ... )`` blocks, and
+    ignores ``//`` comments. Only the core module itself counts (not
+    ``gotdms-python``). A target is a local directory the way Go decides it:
+    it starts with ``./`` or ``../`` (or is ``.`` or ``..``), or it is an
+    absolute path (``/``, ``\\``, or a drive letter). A module-path target
+    such as ``github.com/fork/gotdms v0.2.0`` is allowed.
+    """
+    in_block = False
+    for line in gomod.splitlines():
+        text = line.split("//", 1)[0].strip()
+        if not text:
+            continue
+        if in_block:
+            if text == ")":
+                in_block = False
                 continue
-            if "github.com/trey-copeland/gotdms" in stripped and "=>" in stripped:
-                dest = stripped.split("=>", 1)[1].strip()
-                if dest in {"../", ".."}:
-                    raise RuntimeError(
-                        "go.mod still replaces gotdms with ../. "
-                        "This repository requires a module version instead."
-                    )
+            spec = text
+        elif text.startswith("replace"):
+            rest = text[len("replace"):].strip()
+            if rest == "(":
+                in_block = True
+                continue
+            if not text[len("replace"):][:1].isspace():
+                continue
+            spec = rest
+        else:
+            continue
+        if "=>" not in spec:
+            continue
+        left, right = (part.split() for part in spec.split("=>", 1))
+        if not left or left[0].strip('"') != _GOTDMS or not right:
+            continue
+        target = right[0].strip('"')
+        if (
+            target in {".", ".."}
+            or target.startswith(("./", "../", ".\\", "..\\", "/", "\\"))
+            or (len(target) > 1 and target[1] == ":")
+        ):
+            return target
+    return None
 
 
 def _default_plat_tag() -> str:

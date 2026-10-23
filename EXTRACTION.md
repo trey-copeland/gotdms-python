@@ -16,15 +16,15 @@ Nothing has been tagged in this repository. `pyproject.toml` records version `0.
 `go.mod` requires:
 
 ```
-github.com/trey-copeland/gotdms v0.1.2
+github.com/trey-copeland/gotdms v0.2.0
 ```
 
-`v0.1.2` is commit `8d2f134a160600c8a12b2076cc395c6b05c5c9e2`. It skips bytes between the object list and the raw-data offset, so files with that metadata padding, such as NI HSAI DAQmx captures, open. `v0.1.1` is `7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8`. `v0.1.0` is `622cb34bacb80fd810d46ee77183e2bae80bf52d`, which already has the dataset API this binary imports (declared timestamp channels, basis, `ReadMany`), `Writer.Stream`, and DAQmx raw reads (index words `0x1269`, `0x1369`, and `0x126A`). There is no `replace` directive. `go build` and `go test` download this module.
+`v0.2.0` is commit `290bb791b00ad56edeee814960062107d0600cc8`. It is the first core tag with `dataset.WithSharedClock` and `dataset.WithoutTimes`, which protocol 2 reads with. `v0.1.2` is `8d2f134a160600c8a12b2076cc395c6b05c5c9e2`. It skips bytes between the object list and the raw-data offset, so files with that metadata padding, such as NI HSAI DAQmx captures, open. `v0.1.1` is `7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8`. `v0.1.0` is `622cb34bacb80fd810d46ee77183e2bae80bf52d`, which already has the dataset API this binary imports (declared timestamp channels, basis, `ReadMany`), `Writer.Stream`, and DAQmx raw reads (index words `0x1269`, `0x1369`, and `0x126A`). There is no `replace` directive. `go build` and `go test` download this module.
 
 To move the pin:
 
 ```bash
-go get github.com/trey-copeland/gotdms@v0.1.2
+go get github.com/trey-copeland/gotdms@v0.2.0
 go mod tidy
 go test ./...
 ```
@@ -50,7 +50,7 @@ This repository does not do that.
 
 The core module, this Go module, and the Python package version independently.
 
-- Core tags (`v0.1.0` and later) are the gotdms reader. They are not this package's version. The pin above is the source of truth for which core tag this binary builds against. That pin is `v0.1.2`, which is newer than this package's unreleased `0.1.0`.
-- Python `0.1.0` in `pyproject.toml` is this wrapper. Nothing in this repository has been tagged. The first Git tag of this repo can still be `v0.1.0`. It will not match the core tag, because the core module is already at `v0.1.2`. Say so in the changelog when this package is tagged.
-- The compatibility contract with a running `gotdms-bridge` is protocol version 1 (`ProtocolVersion` in `frame.go`), not the core tag. A bridge and a client disagree when that number disagrees.
-- The minimum core source this binary can compile is the dataset API. That API is in gotdms `v0.1.0` and later. The pin in `go.mod` is `v0.1.2`.
+- Core tags (`v0.1.0` and later) are the gotdms reader. They are not this package's version. The pin above is the source of truth for which core tag this binary builds against. That pin is `v0.2.0`, which is newer than this package's unreleased `0.1.0`.
+- Python `0.1.0` in `pyproject.toml` is this wrapper. Nothing in this repository has been tagged. The first Git tag of this repo can still be `v0.1.0`. It will not match the core tag, because the core module is already at `v0.2.0`. Say so in the changelog when this package is tagged.
+- The compatibility contract with a running `gotdms-bridge` is protocol version 2 (`ProtocolVersion` in `frame.go`), not the core tag. A bridge and a client disagree when that number disagrees. Version 1 is not supported by either side.
+- The minimum core this binary can compile is `v0.2.0`: protocol 2 reads with `dataset.WithSharedClock`, and values-only reads use `dataset.WithoutTimes`. Neither is in `v0.1.2` or earlier. `hatch_build.py` refuses to package a `go.mod` that replaces gotdms with a local directory. When the pin moves, update it with the commands above, plus the pin text above, `README.md`, `THIRD_PARTY.md`, the `go.mod` comment, and the `hatch_build.py` and `scripts/build_dist.py` docstrings.

@@ -16,8 +16,8 @@ import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ._process import StderrTail, shutdown, start_drain
-from .codec import as_polars, series_from_parts, split_payload, write_frame, read_frame
+from ._process import StderrTail, kill, shutdown, start_drain
+from .codec import as_polars, read_reply, series_from_reply, write_frame
 from .errors import (
     AmbiguousChannelError,
     ArgumentError,
@@ -82,7 +82,7 @@ def locate_binary(explicit=None) -> str:
         "gotdms-bridge was not found. Install a platform wheel so the binary "
         "is bundled (`pip install gotdms`), or set GOTDMS_BRIDGE to a binary "
         "from `go build -o gotdms-bridge ./cmd/gotdms-bridge` in the "
-        "gotdms-python source tree (Go required). Protocol version 1."
+        "gotdms-python source tree (Go required). Protocol version 2."
     )
 
 
@@ -121,6 +121,7 @@ class Session:
         self._finalizer = weakref.finalize(self, shutdown, self._proc, self._lock)
         self._catalog = None
         self._closed = False
+        self._broken = None
 
     def __enter__(self):
         return self
@@ -295,7 +296,10 @@ class Session:
         """Read several channels in one request.
 
         The bridge calls dataset ``ReadMany`` once, so channels that share a
-        timestamp channel share one clock decode. Pass both ``start`` and
+        timestamp channel share one clock decode. Each distinct time axis is
+        sent once, and channels on it get the same ``time_ns`` array object
+        (read-only, like every array from a read). Each channel's ``y`` has
+        its own buffer, so keeping one channel does not keep the others. Pass both ``start`` and
         ``end`` for a half-open window. Omit both for the full span.
 
         ``offset`` and ``limit`` select a sample range of the merged series
@@ -399,13 +403,16 @@ class Session:
             header["offset"] = int(offset)
         if limit is not None:
             header["limit"] = int(limit)
-        header_out, payload = self._rpc_raw(header)
+        reply = self._rpc_raw(header)
+        if reply.streams is None:
+            raise ProtocolError("read reply is not a data reply; rebuild gotdms-bridge")
+        header_out = reply.header
         if (offset is not None or limit is not None) and not header_out.get("limited"):
             raise ProtocolError(
                 "gotdms-bridge ignored the sample range. Rebuild gotdms-bridge; "
-                "protocol 1 range reads are required."
+                "protocol 2 range reads are required."
             )
-        series = series_from_parts(header_out.get("channels", []), split_payload(payload))
+        series = series_from_reply(header_out, reply.streams)
         if relative and absolute:
             for item in series:
                 _ = item.relative_s
@@ -481,27 +488,49 @@ class Session:
         return self._catalog.get("channels", [])
 
     def _rpc(self, header: dict) -> dict:
-        decoded, payload = self._rpc_raw(header)
-        if payload:
+        reply = self._rpc_raw(header)
+        if reply.payload or reply.streams is not None:
             raise ProtocolError("unexpected payload on a metadata response")
-        return decoded
+        return reply.header
 
     def _rpc_raw(self, header: dict):
+        """Send one request and read its whole reply.
+
+        Anything that stops the read partway (a framing fault, a dead
+        bridge, KeyboardInterrupt) leaves the pipe out of sync, so the
+        bridge is killed and the session refuses further calls. An error
+        the bridge reports, before or after ``result_begin``, leaves the
+        session usable.
+        """
         with self._lock:
             if self._closed:
                 raise GotdmsError("session is closed", "session_closed")
+            if self._broken is not None:
+                raise ProtocolError(f"session is unusable after an interrupted reply ({self._broken}); open a new one")
             if self._proc.poll() is not None:
                 raise ProtocolError(self._dead_message())
             try:
                 write_frame(self._proc.stdin, header)
-                decoded, payload = read_frame(self._proc.stdout)
-            except ProtocolError:
-                raise
-            except Exception as exc:
-                raise ProtocolError(self._dead_message()) from exc
-        if decoded.get("op") == "error":
-            _raise_protocol(decoded)
-        return decoded, payload
+                reply = read_reply(self._proc.stdout)
+            except BaseException as exc:
+                dead = self._proc.poll() is not None
+                self._break(exc)
+                if isinstance(exc, ProtocolError) or not isinstance(exc, Exception):
+                    raise
+                if dead or self._stderr.text():
+                    raise ProtocolError(self._dead_message()) from exc
+                raise ProtocolError(f"{type(exc).__name__}: {exc}") from exc
+        if reply.header.get("op") == "error":
+            _raise_protocol(reply.header)
+        if reply.error is not None:
+            _raise_protocol(reply.error)
+        return reply
+
+    def _break(self, exc: BaseException) -> None:
+        """Kill a bridge whose pipe is out of sync. The lock is held."""
+        self._broken = type(exc).__name__
+        if self._finalizer.detach() is not None:
+            kill(self._proc)
 
     def _dead_message(self) -> str:
         err = self._stderr.text()

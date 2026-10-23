@@ -15,9 +15,9 @@ from pathlib import Path
 
 import numpy as np
 
-from ._process import StderrTail, shutdown, start_drain
+from ._process import StderrTail, kill, shutdown, start_drain
 from .client import _raise_protocol, locate_binary
-from .codec import read_frame, split_payload, write_frame
+from .codec import read_reply, write_frame
 from .errors import ArgumentError, ProtocolError
 
 _MAX_PAYLOAD = 2**31 - 1
@@ -353,8 +353,9 @@ def read_tdms(path, *, binary=None) -> TdmsContents:
     name and, for timestamps, ``seconds`` and ``fraction``.
     """
     with _Bridge(binary) as bridge:
-        header, payload = bridge.call({"op": "read_values", "path": str(path)})
-    parts = split_payload(payload)
+        header, parts = bridge.call({"op": "read_values", "path": str(path)})
+    if parts is None:
+        raise ProtocolError("read_values reply is not a data reply; rebuild gotdms-bridge")
     flat = []
     for group in header.get("groups") or []:
         for channel in group.get("channels") or []:
@@ -806,14 +807,21 @@ class _Bridge:
             raise ProtocolError(self._dead())
         try:
             write_frame(self._proc.stdin, header, payload)
-            decoded, body = read_frame(self._proc.stdout)
-        except ProtocolError:
-            raise
-        except Exception as exc:
+            reply = read_reply(self._proc.stdout)
+        except BaseException as exc:
+            # The pipe is out of sync; this bridge cannot be reused.
+            self._closed = True
+            if self._finalizer.detach() is not None:
+                kill(self._proc)
+            if isinstance(exc, ProtocolError) or not isinstance(exc, Exception):
+                raise
             raise ProtocolError(self._dead()) from exc
-        if decoded.get("op") == "error":
-            _raise_protocol(decoded)
-        return decoded, body
+        if reply.header.get("op") == "error":
+            _raise_protocol(reply.header)
+        if reply.error is not None:
+            _raise_protocol(reply.error)
+        # A data reply returns its streams; a single frame its payload.
+        return reply.header, (reply.streams if reply.streams is not None else reply.payload)
 
     def close(self):
         if self._closed:

@@ -4,7 +4,9 @@
 //	gotdms-bridge convert --dir run --timestamp-channel Time --numeric-epoch 2024-03-01T00:00:00Z --out out
 //	gotdms-bridge demo --out fixtures
 //
-// serve speaks protocol version 1 on stdin and stdout. convert writes an
+// serve speaks protocol version 2 on stdin and stdout. GOTDMS_BRIDGE_PART_BYTES
+// lowers the part-frame cap (default and maximum 64 MiB) so tests can force
+// a reply into many parts. convert writes an
 // Arrow IPC bundle. demo writes the small multi-file set used by tests.
 package main
 
@@ -13,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,7 +31,16 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "serve":
-		err = bridge.Serve(os.Stdin, os.Stdout)
+		partCap := bridge.MaxPart
+		if v := os.Getenv("GOTDMS_BRIDGE_PART_BYTES"); v != "" {
+			n, perr := strconv.Atoi(v)
+			if perr != nil || n < 1 || n > bridge.MaxPart {
+				fmt.Fprintf(os.Stderr, "gotdms-bridge: GOTDMS_BRIDGE_PART_BYTES=%q is not 1..%d\n", v, bridge.MaxPart)
+				os.Exit(2)
+			}
+			partCap = n
+		}
+		err = bridge.ServeParts(os.Stdin, os.Stdout, partCap)
 	case "convert":
 		err = runConvert(os.Args[2:])
 	case "demo":
