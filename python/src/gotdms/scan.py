@@ -180,8 +180,8 @@ def scan_tdms(
             session.open(**open_kwargs)
             series, header = session.read_channels(
                 specs,
-                absolute=True,
-                relative=True,
+                absolute=bool(absolute_time),
+                relative=not absolute_time,
                 scaled=scaled,
                 basis=basis,
                 limit=limit,

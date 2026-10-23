@@ -286,7 +286,7 @@ class Session:
         start=None,
         end=None,
         absolute=True,
-        relative=True,
+        relative=None,
         scaled=False,
         basis=None,
         offset=None,
@@ -303,6 +303,17 @@ class Session:
         ``Channel.Slice`` and does not decode the other samples. Omit both
         for the full series. A time window and a sample range together are
         an error.
+
+        ``absolute`` (default True) returns ``time_ns``. ``relative``
+        defaults to ``None``, which means ``not absolute``: the bridge sends
+        one time column, never both. ``Series.relative_s`` is still
+        available with absolute time: it is computed in Python from
+        ``time_ns`` and the basis on first access, bit-for-bit what the
+        bridge computes. Pass ``relative=True`` to have it computed during
+        the read. ``absolute=False`` alone (or with ``relative=True``) asks
+        the bridge for ``relative_s`` only. ``absolute=False,
+        relative=False`` sends sample values only, and ``relative_s`` is
+        then ``None`` for a timed channel.
 
         ``scaled`` defaults to False. gotdms returns raw samples. Set it only
         when you want a scale applied. There is no silent scale. npTDMS
@@ -344,7 +355,7 @@ class Session:
         start=None,
         end=None,
         absolute=True,
-        relative=True,
+        relative=None,
         scaled=False,
         basis=None,
         offset=None,
@@ -365,11 +376,16 @@ class Session:
                 specs.append({"name": ch.name, "group": ch.group})
             else:
                 specs.append({"name": item["name"], "group": item.get("group", "")})
+        # relative=None means "not absolute". Relative time is derived from
+        # time_ns in Python when absolute time is on the wire, so the bridge
+        # sends at most one time column.
+        if relative is None:
+            relative = not absolute
         header = {
             "op": "read_many",
             "channels": specs,
             "absolute": bool(absolute),
-            "relative": bool(relative),
+            "relative": bool(relative) and not absolute,
             "scaled": bool(scaled),
         }
         if (start is None) ^ (end is None):
@@ -390,6 +406,9 @@ class Session:
                 "protocol 1 range reads are required."
             )
         series = series_from_parts(header_out.get("channels", []), split_payload(payload))
+        if relative and absolute:
+            for item in series:
+                _ = item.relative_s
         return series, header_out
 
     def read_all(self, **kwargs):
@@ -431,12 +450,13 @@ class Session:
                 selected = self.group(group)._data_channels()
         else:
             selected = channels
+        # Only the time column the frame uses is sent.
         series = self.read_many(
             selected,
             start=start,
             end=end,
-            absolute=True,
-            relative=True,
+            absolute=bool(absolute_time),
+            relative=not absolute_time,
             scaled=scaled,
             basis=basis,
         )
@@ -632,7 +652,13 @@ class Channel:
         """
         kwargs.pop("absolute", None)
         kwargs.pop("relative", None)
-        series = self.session.read(self.name, self.group, absolute=True, relative=True, **kwargs)
+        series = self.session.read(
+            self.name,
+            self.group,
+            absolute=bool(absolute_time),
+            relative=not absolute_time,
+            **kwargs,
+        )
         return series.time_track(absolute_time)
 
     def as_polars(self, **kwargs):

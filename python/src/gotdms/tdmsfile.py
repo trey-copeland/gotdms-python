@@ -570,7 +570,7 @@ def _series_from_ipc(name, blob, wire):
     import pyarrow as pa
     import polars as pl
 
-    reader = pa.ipc.open_stream(io.BytesIO(blob))
+    reader = pa.ipc.open_stream(pa.py_buffer(blob))
     table = reader.read_all()
     if table.num_columns != 1:
         raise ProtocolError(f"channel {name} Arrow stream has {table.num_columns} columns")
