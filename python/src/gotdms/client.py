@@ -1,10 +1,12 @@
 """Long-lived client for the gotdms-bridge ``serve`` process.
 
-One process, one open dataset, many reads. Each request is one frame and
-each response is one frame. Channels that share a timestamp channel share
-one clock decode in the dataset layer, but each channel's Arrow stream
-still carries its own copy of the time columns. This module does not
-import npTDMS.
+One process, one open dataset, many reads. Each request is one frame.
+A metadata reply is one frame; a data reply is ``result_begin``, ``part``
+frames, and ``result_end`` (see :mod:`gotdms.codec`). Channels that share a
+timestamp channel share one clock decode in the dataset layer, and each
+distinct time axis is sent once: channels are columns packed into a few
+Arrow streams and name their clock by id. This module does not import
+npTDMS.
 """
 
 from __future__ import annotations
