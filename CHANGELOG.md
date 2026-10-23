@@ -4,6 +4,12 @@ Nothing in this repository has been tagged. Nothing has been uploaded to PyPI.
 
 ## Unreleased
 
+- A bad TDMS file raises `CorruptFileError` (code `corrupt`) from `open`, `scan_tdms`, and `read_tdms`. That covers a wrong segment tag, an unsupported version, a corrupt structure, and a truncated file. Before, `read_tdms` and append-mode `write_tdms` raised `ArgumentError` and `open` and `scan_tdms` raised `GotdmsError` with code `error`. `CorruptFileError` subclasses `GotdmsError`. A missing path is `ArgumentError` from all three; before, `open` and `scan_tdms` raised `GotdmsError` with code `error` for it. The bridge sends the new code; protocol version stays 1.
+- A `Session` that is dropped without `close` stops its bridge process when it is garbage collected (`weakref.finalize`). Before, the stderr thread kept the session alive and the process ran until the interpreter exited. At interpreter exit the finalizer does not write to a bridge that another thread is still reading from; it closes stdin and the bridge exits. `close` and `with` are still preferred.
+- Bridge stderr kept for error messages is capped at the last 64 KiB per process.
+- `read_tdms` on Python 3.10 no longer fails on a timestamp property whose fraction is not 3 or 6 digits (for example `.25`). Python 3.10 `datetime.fromisoformat` rejects those.
+- Doc fixes: EXTRACTION.md no longer says gotdms still has `bridge/`; missing-dependency messages no longer name extras that do not exist; the client docstring says each channel's stream carries its own time columns.
+
 - The gotdms pin moved to `v0.1.2` (`8d2f134a160600c8a12b2076cc395c6b05c5c9e2`). Files with metadata padding between the object list and the raw-data offset, such as NI HSAI DAQmx captures, now open.
 - Require `github.com/trey-copeland/gotdms` `v0.1.1` (`7d514a7710d8ed18f3884a78c19e4cfcbe2b32a8`). That tag is `v0.1.0` (`622cb34bacb80fd810d46ee77183e2bae80bf52d`) plus the fix for `ReadValues` and `Group.Values` when an interleaved channel continues in a later segment. This package was not affected: `read_tdms` reads each channel with `Channel.Values`, and `open`, `read`, and `scan_tdms` read through the dataset layer, which also reads each channel on its own. A regression test now covers interleaved channels that continue in a later segment on all of those paths. This package does not build segment-index sidecars. gotdms `v0.1.1` writes those sidecars as version 2, and a reader built with gotdms `v0.1.0` treats a version 2 sidecar as a miss.
 

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
+	"github.com/trey-copeland/gotdms"
 	"github.com/trey-copeland/gotdms/dataset"
 )
 
@@ -653,6 +655,17 @@ func (e *coded) Error() string { return e.msg }
 
 func errCode(code, msg string) error { return &coded{code: code, msg: msg} }
 
+// isCorrupt reports whether err means the TDMS bytes themselves are bad:
+// a wrong segment tag, an unknown version, a structure that contradicts the
+// format, or a file that ends early. Those are sent with code "corrupt" so a
+// caller can tell a bad file from a bad argument.
+func isCorrupt(err error) bool {
+	return errors.Is(err, tdms.ErrBadTag) ||
+		errors.Is(err, tdms.ErrVersion) ||
+		errors.Is(err, tdms.ErrCorrupt) ||
+		errors.Is(err, tdms.ErrTruncated)
+}
+
 func classify(err error) (string, string, []channelJSON) {
 	var c *coded
 	if errors.As(err, &c) {
@@ -669,6 +682,14 @@ func classify(err error) (string, string, []channelJSON) {
 			}
 		}
 		return "ambiguous", amb.Error(), out
+	}
+	// A missing path is the caller's mistake on every entry point, the same
+	// as asArg reports it for read_values and append.
+	if errors.Is(err, os.ErrNotExist) {
+		return "argument", err.Error(), nil
+	}
+	if isCorrupt(err) {
+		return "corrupt", err.Error(), nil
 	}
 	switch {
 	case errors.Is(err, dataset.ErrUntimed):

@@ -1,6 +1,6 @@
 # gotdms-python
 
-This repository is the Python client and the `gotdms-bridge` binary. It was extracted from `bridge/` in [gotdms](https://github.com/trey-copeland/gotdms) onto the root of [gotdms-python](https://github.com/trey-copeland/gotdms-python). Workflows live at `.github/workflows/`. `pyproject.toml`, `go.mod`, and `python/` are at the root. `bridge/` is still present in the gotdms repository; removing it there is a separate change.
+This repository is the Python client and the `gotdms-bridge` binary. It was extracted from `bridge/` in [gotdms](https://github.com/trey-copeland/gotdms) onto the root of [gotdms-python](https://github.com/trey-copeland/gotdms-python). Workflows live at `.github/workflows/`. `pyproject.toml`, `go.mod`, and `python/` are at the root. gotdms removed `bridge/` in [trey-copeland/gotdms#9](https://github.com/trey-copeland/gotdms/pull/9) (9df0060).
 
 ## Names
 

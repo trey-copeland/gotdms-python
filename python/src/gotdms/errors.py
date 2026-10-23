@@ -23,6 +23,19 @@ class ArgumentError(GotdmsError):
         super().__init__(message, "argument")
 
 
+class CorruptFileError(GotdmsError):
+    """The TDMS bytes are bad, not the call.
+
+    Raised for a wrong segment tag, an unsupported TDMS version, a structure
+    that contradicts the format, or a file that ends early (truncated). The
+    same file raises this from :func:`gotdms.open`, :func:`gotdms.scan_tdms`,
+    and :func:`gotdms.read_tdms`. A missing path is :class:`ArgumentError`.
+    """
+
+    def __init__(self, message):
+        super().__init__(message, "corrupt")
+
+
 class AmbiguousChannelError(GotdmsError):
     """The channel name exists in more than one group.
 

@@ -131,7 +131,8 @@ def decode_ipc(blob: bytes):
         import pyarrow.ipc as ipc
     except ImportError as exc:
         raise GotdmsError(
-            "pyarrow is required to decode Arrow IPC; install gotdms[arrow]"
+            "pyarrow is required to decode Arrow IPC. It is a gotdms "
+            "dependency; reinstall gotdms or run `pip install pyarrow`"
         ) from exc
     reader = ipc.open_stream(io.BytesIO(blob))
     table = reader.read_all()
@@ -188,7 +189,10 @@ def as_polars(series: list[Series], *, time: str = "column", absolute_time: bool
     try:
         import polars as pl
     except ImportError as exc:
-        raise GotdmsError("polars is required for as_polars; install gotdms[polars]") from exc
+        raise GotdmsError(
+            "polars is required for as_polars. It is a gotdms dependency; "
+            "reinstall gotdms or run `pip install polars`"
+        ) from exc
     if time == "index":
         raise ArgumentError(
             "Polars has no row index. npTDMS time_index=True is the 'time' column "
