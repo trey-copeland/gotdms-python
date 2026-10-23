@@ -122,15 +122,22 @@ def _ipc(batch) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
-def _v2_reply(header: dict, streams: list, part: int, end=None) -> bytes:
-    """Frames of a protocol 2 data reply, each stream cut into parts."""
+def _v2_reply(header: dict, streams: list, part: int, end=None, kinds=None, batches=None) -> bytes:
+    """Frames of a protocol 2 data reply, each stream cut into parts.
+
+    ``kinds`` and ``batches`` are per stream; they default to ``"x"`` and 1.
+    """
     from gotdms.codec import MAGIC, VERSION, _PREFIX
 
     def frame(h, payload=b""):
         body = json.dumps(h).encode()
         return _PREFIX.pack(MAGIC, VERSION, 0, len(body), len(payload)) + body + payload
 
-    begin = dict(header, op="result_begin", streams=[{"id": i, "kind": "x", "bytes": len(s)} for i, s in enumerate(streams)])
+    kinds = kinds or ["x"] * len(streams)
+    batches = batches or [1] * len(streams)
+    begin = dict(header, op="result_begin", streams=[
+        {"id": i, "kind": kinds[i], "bytes": len(s), "batches": batches[i]} for i, s in enumerate(streams)
+    ])
     out = [frame(begin)]
     for i, s in enumerate(streams):
         for off in range(0, len(s), part):
@@ -174,16 +181,20 @@ class ZeroCopyTest(unittest.TestCase):
         from gotdms.codec import as_polars, read_reply, series_from_reply
 
         n = 50
-        clock = _ipc(pa.record_batch([pa.array(np.arange(n, dtype=np.int64) * 10)], names=["time_ns"]))
-        other = _ipc(pa.record_batch([pa.array(np.arange(n, dtype=np.int64) * 7)], names=["time_ns"]))
-        chans = [_ipc(pa.record_batch([pa.array(np.full(n, float(k)))], names=["y"])) for k in range(4)]
-        meta = lambda name, clk, sid: {"name": name, "group": "g", "timed": clk is not None, "clock": clk, "stream": sid,
-                                       "basis": "1970-01-01T00:00:00Z", "samples": n}
+        # Both clocks are columns of one batch; a, b, and c are columns of one
+        # channel batch; u has a stream of its own.
+        clocks = _ipc(pa.record_batch([pa.array(np.arange(n, dtype=np.int64) * 10), pa.array(np.arange(n, dtype=np.int64) * 7)],
+                                      names=["time_ns_0", "time_ns_1"]))
+        chans = _ipc(pa.record_batch([pa.array(np.full(n, float(k))) for k in range(3)], names=["y_0", "y_1", "y_2"]))
+        lone = _ipc(pa.record_batch([pa.array(np.full(n, 3.0))], names=["y"]))
+        meta = lambda name, clk, sid, col: {"name": name, "group": "g", "timed": clk is not None, "clock": clk, "stream": sid,
+                                            "batch": 0, "column": col, "basis": "1970-01-01T00:00:00Z", "samples": n}
         header = {
-            "clocks": [{"id": 0, "samples": n, "stream": 0}, {"id": 1, "samples": n, "stream": 1}],
-            "channels": [meta("a", 0, 2), meta("b", 0, 3), meta("c", 1, 4), meta("u", None, 5)],
+            "clocks": [{"id": 0, "samples": n, "stream": 0, "batch": 0, "column": 0},
+                       {"id": 1, "samples": n, "stream": 0, "batch": 0, "column": 1}],
+            "channels": [meta("a", 0, 1, 0), meta("b", 0, 1, 1), meta("c", 1, 1, 2), meta("u", None, 2, 0)],
         }
-        reply = read_reply(io.BytesIO(_v2_reply(header, [clock, other] + chans, 9)))
+        reply = read_reply(io.BytesIO(_v2_reply(header, [clocks, chans, lone], 9, kinds=["clock", "channel", "channel"])))
         a, b, c, u = series_from_reply(reply.header, reply.streams)
         self.assertIs(a.time_ns, b.time_ns)
         self.assertIsNot(a.time_ns, c.time_ns)
@@ -250,9 +261,9 @@ class ZeroCopyTest(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(ProtocolError, why.get(name, "")):
                 read_reply(io.BytesIO(data))
         # A clock id that is not in the table.
-        header = {"clocks": [], "channels": [{"name": "a", "clock": 4, "stream": 0}]}
-        reply = read_reply(io.BytesIO(_v2_reply(header, [blob], 64)))
-        with self.assertRaises(ProtocolError):
+        header = {"clocks": [], "channels": [{"name": "a", "clock": 4, "stream": 0, "batch": 0, "column": 0}]}
+        reply = read_reply(io.BytesIO(_v2_reply(header, [blob], 64, kinds=["channel"])))
+        with self.assertRaisesRegex(ProtocolError, "unknown clock"):
             series_from_reply(reply.header, reply.streams)
 
     def test_mid_stream_error_is_returned(self):

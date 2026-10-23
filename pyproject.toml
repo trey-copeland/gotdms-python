@@ -30,6 +30,11 @@ dependencies = [
   "numpy>=1.26",
   "polars>=2",
   "pyarrow>=14",
+  # Polars turns a Datetime column with a time zone (every time column this
+  # package returns is Datetime("ns", "UTC")) into Python datetimes through
+  # zoneinfo. Windows has no system IANA database, so without tzdata
+  # to_list(), rows(), and iteration raise ZoneInfoNotFoundError for "UTC".
+  "tzdata; sys_platform == 'win32'",
 ]
 
 [project.urls]

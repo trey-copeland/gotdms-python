@@ -298,9 +298,13 @@ class Session:
         The bridge calls dataset ``ReadMany`` once, so channels that share a
         timestamp channel share one clock decode. Each distinct time axis is
         sent once, and channels on it get the same ``time_ns`` array object
-        (read-only, like every array from a read). Each channel's ``y`` has
-        its own buffer, so keeping one channel does not keep the others. Pass both ``start`` and
-        ``end`` for a half-open window. Omit both for the full span.
+        (read-only, like every array from a read). Channels are packed as
+        columns of a few Arrow streams, and ``y`` is a view of its stream's
+        buffer: keeping one channel keeps that stream alive, which holds at
+        most 16 MiB of other channels (a channel over 16 MiB has a stream of
+        its own). ``numpy.copy`` a short channel you keep for long. Pass both
+        ``start`` and ``end`` for a half-open window. Omit both for the full
+        span.
 
         ``offset`` and ``limit`` select a sample range of the merged series
         instead of a time window. The bridge reads that range with

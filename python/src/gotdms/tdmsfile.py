@@ -17,7 +17,7 @@ import numpy as np
 
 from ._process import StderrTail, kill, shutdown, start_drain
 from .client import _raise_protocol, locate_binary
-from .codec import read_reply, write_frame
+from .codec import ReplyColumns, _is_int, numpy_view, read_reply, write_frame
 from .errors import ArgumentError, ProtocolError
 
 _MAX_PAYLOAD = 2**31 - 1
@@ -356,19 +356,12 @@ def read_tdms(path, *, binary=None) -> TdmsContents:
         header, parts = bridge.call({"op": "read_values", "path": str(path)})
     if parts is None:
         raise ProtocolError("read_values reply is not a data reply; rebuild gotdms-bridge")
-    flat = []
-    for group in header.get("groups") or []:
-        for channel in group.get("channels") or []:
-            flat.append((group["name"], channel))
-    if len(parts) != len(flat):
-        raise ProtocolError(f"{len(flat)} channels and {len(parts)} Arrow payloads")
+    cols = ReplyColumns(header.get("streams"), parts)
     groups = {}
-    cursor = 0
     for group in header.get("groups") or []:
         channels = {}
         for channel in group.get("channels") or []:
-            series = _series_from_ipc(channel["name"], parts[cursor], channel.get("type"))
-            cursor += 1
+            series = _series_from_column(channel, cols)
             typed = channel.get("properties") or []
             channels[channel["name"]] = TdmsChannel(
                 name=channel["name"],
@@ -386,6 +379,7 @@ def read_tdms(path, *, binary=None) -> TdmsContents:
             typed_properties=typed,
             channels=channels,
         )
+    cols.finish()
     typed = header.get("properties") or []
     return TdmsContents(
         path=str(path),
@@ -567,21 +561,46 @@ def _series_ipc(series) -> bytes:
     return sink.getvalue()
 
 
-def _series_from_ipc(name, blob, wire):
+def _fixed_width_view(arr):
     import pyarrow as pa
+
+    t = arr.type
+    if arr.null_count == 0 and (pa.types.is_integer(t) or pa.types.is_floating(t) or (pa.types.is_timestamp(t) and t.unit == "ns")):
+        return numpy_view(arr)
+    return None
+
+
+def _series_from_column(channel, cols):
+    """One channel of a ``read_values`` reply as a Polars series, zero-copy
+    where Arrow allows. The channel names its stream, batch, and column."""
     import polars as pl
 
-    reader = pa.ipc.open_stream(pa.py_buffer(blob))
-    table = reader.read_all()
-    if table.num_columns != 1:
-        raise ProtocolError(f"channel {name} Arrow stream has {table.num_columns} columns")
-    values = pl.from_arrow(table.column(0))
+    name = channel.get("name")
+    what = f"channel {name!r}"
+    arr = cols.take(what, channel.get("stream"), channel.get("batch"), channel.get("column"), "y", "values")
+    rows = channel.get("rows")
+    if channel.get("type") == "void":
+        if len(arr) != 0:
+            raise ProtocolError(f"{what} is void and has {len(arr)} values")
+        return pl.Series(name, [], dtype=pl.Null)
+    if _is_int(rows) and len(arr) != rows:
+        raise ProtocolError(f"{what} has {len(arr)} values, header says {rows}")
+    view = _fixed_width_view(arr)
+    if view is not None:
+        # Numeric and timestamp columns go through a numpy view: no copy, and
+        # no pyarrow.compute import, which pl.from_arrow pays (about 40 ms)
+        # on its first call in a process.
+        values = pl.Series(name, view)
+        if view.dtype.kind == "M":
+            # The view is naive nanoseconds since the epoch in UTC; the
+            # bridge's timestamp type names the zone (always UTC today).
+            values = values.cast(pl.Datetime("ns", arr.type.tz or None))
+        return values
+    values = pl.from_arrow(arr)
     if isinstance(values, pl.DataFrame):
         values = values.to_series(0)
     if not isinstance(values, pl.Series):
         values = pl.Series(values)
-    if wire == "void":
-        return pl.Series(name, [], dtype=pl.Null)
     return values.rename(name)
 
 

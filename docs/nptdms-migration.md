@@ -23,7 +23,7 @@ go build -o gotdms-bridge ./cmd/gotdms-bridge
 export GOTDMS_BRIDGE="$PWD/gotdms-bridge"
 ```
 
-A platform wheel bundles `gotdms-bridge`. `locate_binary` uses an explicit path, then `GOTDMS_BRIDGE`, then that file. NumPy, Polars, and pyarrow are dependencies of the Python package (`requires-python` is `>=3.10` because Polars 2.0 requires it). If a caller still wants a pandas object, Polars provides `frame.to_pandas()`. That conversion is not a dependency of this package.
+A platform wheel bundles `gotdms-bridge`. `locate_binary` uses an explicit path, then `GOTDMS_BRIDGE`, then that file. NumPy, Polars, and pyarrow are dependencies of the Python package, and on Windows so is `tzdata` (Apache-2.0), because Polars needs an IANA time zone database to turn the `Datetime("ns", "UTC")` time columns into Python datetimes and Windows has none (`requires-python` is `>=3.10` because Polars 2.0 requires it). If a caller still wants a pandas object, Polars provides `frame.to_pandas()`. That conversion is not a dependency of this package.
 
 ## Two modes
 
@@ -173,7 +173,7 @@ npTDMS `time_track(absolute_time=False)` needs `wf_increment` and `wf_start_offs
 
 A window is half-open: `start <= t < end`. Pass both ends. A window on an untimed channel raises `UntimedError`.
 
-`read_many` is the call to use for several channels. One response carries every channel's values and the shared `time_ns` column. Python does not loop per channel and does not decode the clock.
+`read_many` is the call to use for several channels. One response carries every channel's values and the shared `time_ns` column, packed as columns of a few Arrow streams. Python decodes each stream once and each clock once.
 
 ## Polars frames
 
@@ -239,7 +239,7 @@ A data reply (`read`, `read_many`, `read_values`) is a sequence of frames, so it
 
 ```text
 result_begin  {"op":"result_begin", "channels":[...], "clocks":[...],
-               "streams":[{"id":0,"kind":"clock","bytes":N}, ...],
+               "streams":[{"id":0,"kind":"clock","bytes":N,"batches":B}, ...],
                "reads":[...], "limited":false}            no payload
 part          {"op":"part","stream":k}                     next bytes of stream k, at most 64 MiB
 ...           streams in id order, each in one or more parts
@@ -247,7 +247,9 @@ result_end    {"op":"result_end","streams":n,"bytes":total}
           or  {"op":"result_end","error":{"code":"...","message":"...","stream":k}}
 ```
 
-Every stream is one Arrow IPC stream with one record batch, and `bytes` is its exact size, so the client allocates each stream's buffer once and fills it in place. A `clock` stream has one column, `time_ns` (`int64` Unix nanoseconds). Each distinct time axis is sent once: channels on one timestamp channel, waveform channels with the same start, increment, and sample range, and any other channels whose times are equal sample for sample share a clock. A `channel` stream has `y`, plus `relative_s` when relative time was requested. Each `channels[]` entry names its `stream` and, when it is timed and absolute time was requested, its `clock` id. An untimed channel has no `clock` and sets `absolute_omitted` when absolute time was requested. `read_values` streams have kind `values`, and each channel entry names its `stream`.
+Every stream is one Arrow IPC stream with one schema and `batches` record batches, and `bytes` is its exact size, so the client allocates each stream's buffer once and fills it in place. Channels and clocks are columns: each `channels[]` entry names its `stream`, `batch`, and `column` (its `y`), plus `relative_column` (its `relative_s`, in the same batch) when relative time was requested. Each `clocks[]` entry names `stream`, `batch`, and `column` the same way. A clock column is `time_ns` (`int64` Unix nanoseconds). Each distinct time axis is sent once: channels on one timestamp channel, waveform channels with the same start, increment, and sample range, and any other channels whose times are equal sample for sample share a clock. A timed channel names its `clock` id when absolute time was requested. An untimed channel has no `clock` and sets `absolute_omitted` when absolute time was requested. `read_values` streams have kind `values`, and each channel entry names its `stream`, `batch`, and `column`.
+
+The bridge packs columns into few streams. Channels (or clocks) with the same length and column layout are columns of one record batch, named `y_0`, `y_1`, ... (`relative_s_0`, ... and `time_ns_0`, ...) in that batch. Up to 16 such lengths are packed this way, the ones with the most channels first. Every other channel goes into a "ragged" stream for its column layout, with one record batch per channel and columns named `y` (and `relative_s`, or `time_ns`). A stream holds at most 16 MiB of such channels; a channel over 16 MiB gets a stream of its own. The column a reference names must be its own (`y`, `y_<n>`, and so on), and the client checks that no column is named twice and that every column is named. A stream's buffer lives as long as any array from it, so keeping one short channel can keep up to 16 MiB of the others alive; `numpy.copy` it to drop them. Before this, every channel and clock was a stream of its own: on a 785-channel file a full read paid 785 schema messages, Arrow writers, and `open_stream` calls, which made the bridge far slower than npTDMS on files with many short channels.
 
 An error after `result_begin` (for example, a value that cannot be encoded, or a stream that came out longer or shorter than declared) ends the reply with `result_end` and an `error`. The bridge never sends more bytes of a stream than declared. The client drops the partial streams, raises the matching exception, and keeps the session. A reply that stops without `result_end` (the bridge died, or the client was interrupted) leaves the pipe out of sync, so the client kills the bridge and the session raises `ProtocolError` from then on. `GOTDMS_BRIDGE_PART_BYTES` (an integer from 1 to 67108864) lowers the part cap for tests; it cannot raise it, and any other value makes `gotdms-bridge serve` exit with status 2. The client rejects any frame payload over 64 MiB, a part for a stream before the previous stream is complete, and a `result_end` whose `streams` or `bytes` disagree with `result_begin`.
 

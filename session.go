@@ -87,6 +87,12 @@ type session struct {
 	overlap  dataset.OverlapPolicy
 	wr       *fileWrite
 	partCap  int
+	// occByName indexes occDS's occurrences by channel name. It is rebuilt
+	// when ds changes. A session opens one dataset ("dataset already open"
+	// otherwise) and ends at close, and Dataset has no mutating methods, so
+	// the index is built once and never goes stale.
+	occByName map[string][]dataset.Occurrence
+	occDS     *dataset.Dataset
 }
 
 func (s *session) dispatch(op string, req map[string]json.RawMessage, payload []byte) (any, []byte, error) {
@@ -334,8 +340,9 @@ func (s *session) readMany(sels []dataset.Selector, req map[string]json.RawMessa
 	return encs, err
 }
 
-// finishRead plans a data reply: one clock stream per distinct time axis,
-// then one stream per channel. reads lists channel slices this call
+// finishRead plans a data reply: one clock column per distinct time axis
+// and one y column (plus relative_s) per channel, packed into streams by
+// packStreams, clock streams first. reads lists channel slices this call
 // decoded. limited is false for a dataset read of the whole span.
 func (s *session) finishRead(sels []dataset.Selector, req map[string]json.RawMessage) (any, []byte, error) {
 	encs, reads, limited, err := s.readTables(sels, req)
@@ -358,6 +365,8 @@ type clockOut struct {
 	ID      int `json:"id"`
 	Samples int `json:"samples"`
 	Stream  int `json:"stream"`
+	Batch   int `json:"batch"`
+	Column  int `json:"column"`
 }
 
 // clockSet gives each distinct time axis one id. Series that point to the
@@ -414,33 +423,48 @@ func planRead(encs []*seriesEnc) (*dataResp, error) {
 		}
 	}
 	d := &dataResp{}
-	clockList := make([]clockOut, len(clocks.ns))
+	clockItems := make([]*packItem, len(clocks.ns))
 	for id, ns := range clocks.ns {
 		ns := ns
-		st, err := recordStream("clock", func() (arrow.Record, error) {
-			return oneColumn("time_ns", viewArray(arrow.PrimitiveTypes.Int64, ns), nil), nil
-		})
-		if err != nil {
-			return nil, err
+		clockItems[id] = &packItem{
+			rows:  len(ns),
+			bytes: int64(len(ns)) * 8,
+			cols: []packCol{{base: "time_ns", typ: arrow.PrimitiveTypes.Int64, build: func() (arrow.Array, error) {
+				return viewArray(arrow.PrimitiveTypes.Int64, ns), nil
+			}}},
 		}
-		clockList[id] = clockOut{ID: id, Samples: len(ns), Stream: len(d.streams)}
-		d.streams = append(d.streams, st)
 	}
+	st, err := packStreams("clock", clockItems, 0)
+	if err != nil {
+		return nil, err
+	}
+	d.streams = append(d.streams, st...)
+	clockList := make([]clockOut, len(clocks.ns))
+	for id, it := range clockItems {
+		clockList[id] = clockOut{ID: id, Samples: it.rows, Stream: it.ref.Stream, Batch: it.ref.Batch, Column: it.ref.Column}
+	}
+	items := make([]*packItem, len(encs))
+	for i, e := range encs {
+		items[i] = e.packItem()
+	}
+	st, err = packStreams("channel", items, len(d.streams))
+	if err != nil {
+		return nil, err
+	}
+	d.streams = append(d.streams, st...)
 	metas := make([]channelOut, len(encs))
 	for i, e := range encs {
-		e := e
 		e.meta.Columns = columnNames(false, e.cols.relative)
 		if clockOf[i] >= 0 {
 			id := clockOf[i]
 			e.meta.Clock = &id
 		}
-		sid := len(d.streams)
-		e.meta.Stream = &sid
-		st, err := recordStream("channel", func() (arrow.Record, error) { return e.record(nil, false) })
-		if err != nil {
-			return nil, err
+		ref := items[i].ref
+		e.meta.Stream, e.meta.Batch, e.meta.Column = &ref.Stream, &ref.Batch, &ref.Column
+		if e.cols.relative {
+			rc := ref.Column + 1
+			e.meta.RelColumn = &rc
 		}
-		d.streams = append(d.streams, st)
 		metas[i] = e.meta
 	}
 	d.header = map[string]any{"channels": metas, "clocks": clockList}
@@ -634,10 +658,7 @@ func (s *session) occurrences(sel dataset.Selector) ([]dataset.Occurrence, error
 	}
 	var hits []dataset.Occurrence
 	groups := map[string]struct{}{}
-	for _, o := range s.ds.Occurrences() {
-		if o.Name != sel.Name {
-			continue
-		}
+	for _, o := range s.occurrencesNamed(sel.Name) {
 		if sel.Group != "" && o.Group != sel.Group {
 			continue
 		}
@@ -651,6 +672,24 @@ func (s *session) occurrences(sel dataset.Selector) ([]dataset.Occurrence, error
 		return nil, &dataset.AmbiguousError{Name: sel.Name, Candidates: hits}
 	}
 	return hits, nil
+}
+
+// occurrencesNamed returns the open dataset's occurrences of one channel
+// name, in catalog order. The index is built once per open dataset.
+// Dataset.Occurrences copies the whole catalog on every call, and a read
+// looks each selector up several times, so scanning it per lookup made a
+// read of n channels cost O(n^2): about 85% of the bridge's time on a
+// 785-channel file.
+func (s *session) occurrencesNamed(name string) []dataset.Occurrence {
+	if s.occDS != s.ds || s.occByName == nil {
+		all := s.ds.Occurrences()
+		idx := make(map[string][]dataset.Occurrence, len(all))
+		for _, o := range all {
+			idx[o.Name] = append(idx[o.Name], o)
+		}
+		s.occByName, s.occDS = idx, s.ds
+	}
+	return s.occByName[name]
 }
 
 func (s *session) scaleFor(ser dataset.Series, scaled bool) (scaleInfo, bool, error) {

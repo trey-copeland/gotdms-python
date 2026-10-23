@@ -22,8 +22,11 @@ place with ``readinto``; Arrow decodes it through ``pyarrow.py_buffer``
 without copying, so fixed-width columns are aligned numpy views of that
 buffer. Each buffer lives as long as an array from its stream.
 
-A clock stream has one ``time_ns`` int64 column and is decoded once.
-Channels with the same clock id get the same ``time_ns`` array object.
+Each stream has one schema and ``batches`` record batches. Channels and
+clocks are columns: each names its ``stream``, ``batch``, and ``column``
+(see :class:`ReplyColumns`), so many short channels share one stream and
+one ``open_stream``. A clock column is ``time_ns`` int64 and is decoded
+once. Channels with the same clock id get the same ``time_ns`` array object.
 """
 
 from __future__ import annotations
@@ -457,42 +460,174 @@ def decode_ipc(blob):
     return y, time_ns, relative
 
 
-def decode_clock(blob) -> np.ndarray:
-    """Decode a clock stream: one int64 ``time_ns`` column, zero-copy."""
-    import pyarrow as pa
-    import pyarrow.ipc as ipc
+def numpy_view(col) -> np.ndarray:
+    """A read-only numpy view of one Arrow array's values, without a copy.
 
-    table = ipc.open_stream(pa.py_buffer(blob)).read_all()
-    if table.column_names != ["time_ns"]:
-        raise ProtocolError(f"clock stream has columns {table.column_names}")
-    return np.asarray(table.column("time_ns").to_numpy(zero_copy_only=False), dtype=np.int64)
+    Fixed-width integer, float, and nanosecond timestamp arrays without nulls
+    are viewed straight from their data buffer (``np.frombuffer``), which is
+    much cheaper per column than ``to_numpy`` on older pyarrow. Anything else
+    goes through ``to_numpy``. A timestamp array is ``datetime64[ns]``.
+    """
+    import pyarrow as pa
+
+    t = col.type
+    dtype = None
+    if col.null_count == 0:
+        if pa.types.is_timestamp(t) and t.unit == "ns":
+            dtype = np.dtype("datetime64[ns]")
+        elif pa.types.is_integer(t):
+            # Not DataType.to_pandas_dtype: pyarrow 14 imports pandas there.
+            dtype = np.dtype(f"{'i' if pa.types.is_signed_integer(t) else 'u'}{t.bit_width // 8}")
+        elif pa.types.is_floating(t):
+            dtype = np.dtype(f"f{t.bit_width // 8}")
+    if dtype is None:
+        out = np.asarray(col.to_numpy(zero_copy_only=False))
+        if pa.types.is_timestamp(t):
+            out = out.astype("datetime64[ns]")
+        return out
+    buf = col.buffers()[1]
+    if buf is None or len(col) == 0:
+        out = np.empty(0, dtype=dtype)
+        out.flags.writeable = False
+        return out
+    return np.frombuffer(buf, dtype=dtype, count=len(col), offset=col.offset * dtype.itemsize)
+
+
+class ReplyColumns:
+    """The Arrow streams of one data reply, decoded on first use.
+
+    Protocol 2 packs many channels into one stream: each stream has one
+    schema and ``batches`` record batches, and a channel or clock names its
+    ``stream``, ``batch``, and ``column``. Each stream is opened once, so
+    reading N short channels costs a few ``open_stream`` calls instead of N.
+    Every reference is checked: the stream kind, the batch and column
+    bounds, the column name, and that no column is claimed twice. After the
+    last :meth:`take`, :meth:`finish` checks that every column of every
+    stream was claimed, so a reply cannot carry columns nobody reads.
+    """
+
+    def __init__(self, specs, blobs):
+        if not isinstance(specs, list) or len(specs) != len(blobs):
+            raise ProtocolError("result_begin stream list does not match the streams read")
+        for sid, spec in enumerate(specs):
+            if not isinstance(spec, dict):
+                raise ProtocolError(f"result_begin stream {sid} is {spec!r}")
+            if "batches" not in spec:
+                raise ProtocolError(
+                    f"result_begin stream {sid} does not declare its batches; the bridge predates packed streams, rebuild gotdms-bridge"
+                )
+        self._specs = specs
+        self._blobs = blobs
+        self._batches = [None] * len(blobs)
+        self._names = [None] * len(blobs)
+        self._used = set()
+
+    def batches(self, sid: int):
+        got = self._batches[sid]
+        if got is None:
+            import pyarrow as pa
+            import pyarrow.ipc as ipc
+
+            want = self._specs[sid].get("batches")
+            if not _is_int(want) or want < 1:
+                raise ProtocolError(f"stream {sid} declares {want!r} batches")
+            try:
+                got = list(ipc.open_stream(pa.py_buffer(self._blobs[sid])))
+            except (pa.ArrowException, OSError) as exc:
+                raise ProtocolError(f"stream {sid} is not a valid Arrow IPC stream: {exc}") from exc
+            if len(got) != want:
+                raise ProtocolError(f"stream {sid} has {len(got)} batches, declared {want}")
+            # Every batch of a stream has the stream's schema. Its names are
+            # read once: RecordBatch.schema builds a new object per call.
+            self._names[sid] = got[0].schema.names
+            self._batches[sid] = got
+        return got
+
+    def take(self, what: str, sid, batch, column, base: str, kind: str):
+        """The Arrow array at ``(sid, batch, column)``, named ``base`` or
+        ``base_<n>``, in a stream of ``kind``."""
+        for name, value in (("stream", sid), ("batch", batch), ("column", column)):
+            if not _is_int(value) or value < 0:
+                raise ProtocolError(f"{what} has {name} {value!r}")
+        if sid >= len(self._blobs):
+            raise ProtocolError(f"{what} names stream {sid} of {len(self._blobs)}")
+        if self._specs[sid].get("kind") != kind:
+            raise ProtocolError(f"{what} names {self._specs[sid].get('kind')!r} stream {sid}, want {kind!r}")
+        batches = self.batches(sid)
+        if batch >= len(batches):
+            raise ProtocolError(f"{what} names batch {batch} of stream {sid}, which has {len(batches)}")
+        rb = batches[batch]
+        if column >= rb.num_columns:
+            raise ProtocolError(f"{what} names column {column} of a {rb.num_columns}-column batch")
+        name = self._names[sid][column]
+        if name != base and not (name.startswith(base + "_") and name[len(base) + 1 :].isdigit()):
+            raise ProtocolError(f"{what} names column {name!r}, want {base!r}")
+        key = (sid, batch, column)
+        if key in self._used:
+            raise ProtocolError(f"{what} names column {column} of stream {sid} batch {batch}, already taken")
+        self._used.add(key)
+        return rb.column(column)
+
+    def finish(self) -> None:
+        total = 0
+        for sid in range(len(self._blobs)):
+            total += sum(rb.num_columns for rb in self.batches(sid))
+        if total != len(self._used):
+            raise ProtocolError(f"reply has {total} columns and {len(self._used)} were named")
 
 
 def series_from_reply(header: dict, streams: list) -> list[Series]:
     """Build one :class:`Series` per channel of a ``result_begin`` header.
 
-    Each clock is decoded once. Channels with the same clock id share that
-    ``time_ns`` array object.
+    Each stream is decoded once and each clock once. Channels with the same
+    clock id share that ``time_ns`` array object. ``y`` is a read-only view
+    of its stream's buffer, so a channel keeps alive the stream it was packed
+    in (at most 16 MiB of other channels; a larger channel has a stream of
+    its own).
     """
+    import pyarrow as pa
+
+    cols = ReplyColumns(header.get("streams"), streams)
     clocks = {}
     for clock in header.get("clocks") or []:
-        clocks[clock["id"]] = decode_clock(streams[clock["stream"]])
-        if len(clocks[clock["id"]]) != clock.get("samples", -1):
-            raise ProtocolError(f"clock {clock['id']} has {len(clocks[clock['id']])} samples")
+        if not isinstance(clock, dict):
+            raise ProtocolError(f"clock entry {clock!r}")
+        cid = clock.get("id")
+        what = f"clock {cid!r}"
+        arr = cols.take(what, clock.get("stream"), clock.get("batch"), clock.get("column"), "time_ns", "clock")
+        if not pa.types.is_int64(arr.type):
+            raise ProtocolError(f"{what} is {arr.type}, want int64")
+        if len(arr) != clock.get("samples", -1):
+            raise ProtocolError(f"clock {cid} has {len(arr)} samples")
+        if cid in clocks:
+            raise ProtocolError(f"clock {cid!r} appears twice")
+        clocks[cid] = numpy_view(arr)
     out = []
     for meta in header.get("channels") or []:
-        sid = meta.get("stream")
-        if not isinstance(sid, int) or not 0 <= sid < len(streams):
-            raise ProtocolError(f"channel {meta.get('name')!r} has stream {sid!r}")
-        y, time_ns, relative = decode_ipc(streams[sid])
+        what = f"channel {meta.get('name')!r}"
+        sid, batch = meta.get("stream"), meta.get("batch")
+        y = numpy_view(cols.take(what, sid, batch, meta.get("column"), "y", "channel"))
+        relative = None
+        rc = meta.get("relative_column")
+        if rc is not None:
+            arr = cols.take(what, sid, batch, rc, "relative_s", "channel")
+            if not pa.types.is_float64(arr.type):
+                raise ProtocolError(f"{what} relative_s is {arr.type}, want double")
+            relative = numpy_view(arr)
+        elif "relative_s" in (meta.get("columns") or []):
+            raise ProtocolError(f"{what} lists relative_s without a relative_column")
+        if "samples" in meta and len(y) != meta["samples"]:
+            raise ProtocolError(f"{what} has {len(y)} samples, header says {meta['samples']!r}")
+        time_ns = None
         clock = meta.get("clock")
         if clock is not None:
             if clock not in clocks:
-                raise ProtocolError(f"channel {meta.get('name')!r} names unknown clock {clock!r}")
+                raise ProtocolError(f"{what} names unknown clock {clock!r}")
             time_ns = clocks[clock]
             if len(time_ns) != len(y):
-                raise ProtocolError(f"channel {meta.get('name')!r} has {len(y)} samples and clock {clock} {len(time_ns)}")
+                raise ProtocolError(f"{what} has {len(y)} samples and clock {clock} {len(time_ns)}")
         out.append(Series(meta, y, time_ns, relative))
+    cols.finish()
     return out
 
 
