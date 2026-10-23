@@ -19,10 +19,15 @@
 // stored type (digital lines are uint8). scaled=True on a DAQmx channel
 // applies DAQmxScaledFloat64s and returns float64. No scale is an error.
 //
-// describe returns the same catalog fields as open and does not decode
-// channel samples. read and read_many accept an optional sample offset and
-// limit. The response adds reads (the slices that were decoded) and limited.
-// Omitting both fields keeps the full dataset read.
+// open and catalog send a compact catalog: file paths and channel property
+// pairs are interned once, and rows refer to them by index (see catalog.go).
+// A read header refers into that catalog for its channels' files and
+// properties and for reads[].file instead of repeating them. describe,
+// find, search, and match send full rows. describe returns the same
+// fields as open, expanded, and does not decode channel samples. read and
+// read_many accept an optional sample offset and limit. The response adds
+// reads (the slices that were decoded) and limited. Omitting both fields
+// keeps the full dataset read.
 //
 // write_begin, write_chunk, and write_end write TDMS files. read_values
 // returns stored channel values in native Arrow types. Each channel is read

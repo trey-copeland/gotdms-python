@@ -298,6 +298,10 @@ type client struct {
 	in  *io.PipeWriter
 	out *io.PipeReader
 	err chan error
+	// paths and rows are the last catalog, expanded. Read headers refer
+	// into it, the way the Python client resolves them.
+	paths []string
+	rows  []channelJSON
 }
 
 func start(t *testing.T) *client {
@@ -367,7 +371,9 @@ func (c *client) finish(t *testing.T, f Frame) reply {
 		Message     string          `json:"message"`
 		Channels    json.RawMessage `json:"channels"`
 		Candidates  []channelJSON   `json:"candidates"`
-		Reads       []spanRead      `json:"reads"`
+		Reads       json.RawMessage `json:"reads"`
+		Files       []fileMeta      `json:"files"`
+		PropTable   json.RawMessage `json:"property_table"`
 		Limited     bool            `json:"limited"`
 		SampleReads int             `json:"sample_reads"`
 		Closed      bool            `json:"closed"`
@@ -378,7 +384,7 @@ func (c *client) finish(t *testing.T, f Frame) reply {
 	r := reply{
 		Op: raw.Op, Code: raw.Code, Message: raw.Message,
 		Candidates: raw.Candidates, Payload: f.Payload, Closed: raw.Closed,
-		Reads: raw.Reads, Limited: raw.Limited, SampleReads: raw.SampleReads,
+		Limited: raw.Limited, SampleReads: raw.SampleReads,
 		Header: f.Header,
 	}
 	data := raw.Op == "result_begin"
@@ -400,16 +406,94 @@ func (c *client) finish(t *testing.T, f Frame) reply {
 		r.Payload = joinPayload(parts)
 		r.Clocks = ns
 	}
+	if len(raw.Reads) > 0 && string(raw.Reads) != "null" {
+		var spans []readSpan
+		if err := json.Unmarshal(raw.Reads, &spans); err != nil {
+			t.Fatal(err)
+		}
+		r.Reads = make([]spanRead, len(spans))
+		for i, sp := range spans {
+			r.Reads[i] = sp.spanRead
+			r.Reads[i].File = c.path(t, sp.File)
+		}
+	}
 	if len(raw.Channels) > 0 && string(raw.Channels) != "null" {
-		if data {
-			if err := json.Unmarshal(raw.Channels, &r.Read); err != nil {
+		switch {
+		case data:
+			var rcs []readChannel
+			if err := json.Unmarshal(raw.Channels, &rcs); err != nil {
 				t.Fatal(err)
 			}
-		} else if err := json.Unmarshal(raw.Channels, &r.Channels); err != nil {
-			t.Fatal(err)
+			r.Read = make([]channelOut, len(rcs))
+			for i, rc := range rcs {
+				m := channelOut{outHead: rc.outHead, outMid: rc.outMid, outTail: rc.outTail}
+				if rc.Files != nil {
+					m.Files = make([]string, len(rc.Files))
+					for j, k := range rc.Files {
+						m.Files[j] = c.path(t, k)
+					}
+				}
+				if rc.Properties != nil {
+					k := *rc.Properties
+					if k < 0 || k >= len(c.rows) || c.rows[k].Name != m.Name || c.rows[k].Group != m.Group {
+						t.Fatalf("read header properties %d for %s/%s", k, m.Group, m.Name)
+					}
+					m.Properties = c.rows[k].Properties
+				}
+				r.Read[i] = m
+			}
+		case len(raw.PropTable) > 0:
+			r.Channels = c.expand(t, raw.Files, raw.PropTable, raw.Channels)
+		default:
+			if err := json.Unmarshal(raw.Channels, &r.Channels); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	return r
+}
+
+func (c *client) path(t *testing.T, k int) string {
+	t.Helper()
+	if k < 0 || k >= len(c.paths) {
+		t.Fatalf("file index %d of %d", k, len(c.paths))
+	}
+	return c.paths[k]
+}
+
+// expand turns a compact catalog into full rows and keeps it for reads.
+func (c *client) expand(t *testing.T, files []fileMeta, table, channels json.RawMessage) []channelJSON {
+	t.Helper()
+	var pairs []struct {
+		Name  string `json:"name"`
+		Value any    `json:"value"`
+	}
+	if err := json.Unmarshal(table, &pairs); err != nil {
+		t.Fatal(err)
+	}
+	var rows []catalogChannel
+	if err := json.Unmarshal(channels, &rows); err != nil {
+		t.Fatal(err)
+	}
+	c.paths = c.paths[:0]
+	for _, f := range files {
+		c.paths = append(c.paths, f.Path)
+	}
+	out := make([]channelJSON, len(rows))
+	for i, row := range rows {
+		out[i] = channelJSON{channelHead: row.channelHead, File: c.path(t, row.File), channelCore: row.channelCore}
+		if row.Properties != nil {
+			out[i].Properties = map[string]any{}
+			for _, k := range row.Properties {
+				if k < 0 || k >= len(pairs) {
+					t.Fatalf("property index %d of %d", k, len(pairs))
+				}
+				out[i].Properties[pairs[k].Name] = pairs[k].Value
+			}
+		}
+	}
+	c.rows = out
+	return out
 }
 
 func decodeOne(t *testing.T, r reply) (y []float64, ns []int64, rel []float64) {

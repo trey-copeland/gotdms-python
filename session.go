@@ -1,12 +1,12 @@
 package bridge
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"time"
 
@@ -93,6 +93,8 @@ type session struct {
 	// the index is built once and never goes stale.
 	occByName map[string][]dataset.Occurrence
 	occDS     *dataset.Dataset
+	// cat is the compact catalog, built once at open.
+	cat *catalogIndex
 }
 
 func (s *session) dispatch(op string, req map[string]json.RawMessage, payload []byte) (any, []byte, error) {
@@ -234,21 +236,29 @@ func (s *session) open(req map[string]json.RawMessage) (any, []byte, error) {
 	}
 	var ds *dataset.Dataset
 	var err error
+	var wait func() map[string]*fileScan
 	switch {
 	case dir != "":
 		if pattern == "" {
 			pattern = "*.tdms"
 		}
+		// The same glob OpenGlob runs. A file that appears or vanishes in
+		// between is reconciled by path in scanMetadata.
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		wait = prescan(matches)
 		ds, err = dataset.OpenGlob(dir, pattern, opts...)
 	case len(paths) > 0:
+		wait = prescan(paths)
 		ds, err = dataset.OpenFiles(paths, opts...)
 	default:
 		return nil, nil, errCode("argument", "open needs paths or directory")
 	}
+	// Always wait, so no file handle outlives open.
+	pre := wait()
 	if err != nil {
 		return nil, nil, err
 	}
-	meta, files, groups, err := scanMetadata(ds.Files())
+	meta, files, groups, err := scanMetadata(ds.Files(), pre)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -256,79 +266,59 @@ func (s *session) open(req map[string]json.RawMessage) (any, []byte, error) {
 	s.meta = meta
 	s.files = files
 	s.groups = groups
-	return s.catalog()
-}
-
-func (s *session) catalog() (any, []byte, error) {
-	if err := s.need(); err != nil {
+	s.cat = nil
+	if err := s.buildCatalog(); err != nil {
+		s.ds = nil
 		return nil, nil, err
 	}
-	return map[string]any{
-		"op":       "result",
-		"basis":    s.ds.Basis().UTC().Format(time.RFC3339Nano),
-		"files":    s.files,
-		"groups":   s.groups,
-		"channels": s.enrich(s.ds.Occurrences()),
-	}, nil, nil
+	return s.catalog()
 }
 
 func (s *session) filterName(in []dataset.Occurrence) []channelJSON {
 	return s.enrich(in)
 }
 
+// channelHead and channelCore are a channel row without its file and
+// properties, split so the file key sits after group as it always has.
+type channelHead struct {
+	Name  string `json:"name"`
+	Group string `json:"group"`
+}
+
+type channelCore struct {
+	IsTimestamp  bool      `json:"is_timestamp"`
+	Samples      int       `json:"samples"`
+	Timed        bool      `json:"timed"`
+	Source       string    `json:"source"`
+	Start        string    `json:"start,omitempty"`
+	Last         string    `json:"last,omitempty"`
+	Dt           float64   `json:"dt"`
+	Timestamp    string    `json:"timestamp,omitempty"`
+	DataType     string    `json:"data_type,omitempty"`
+	Unit         string    `json:"unit,omitempty"`
+	HasScale     bool      `json:"has_scale"`
+	Scale        *scaleOut `json:"scale,omitempty"`
+	HasNonlinear bool      `json:"has_nonlinear_scale"`
+	DAQmx        bool      `json:"daqmx,omitempty"`
+	Digital      bool      `json:"digital,omitempty"`
+	DAQmxScale   bool      `json:"daqmx_scale,omitempty"`
+}
+
+// channelJSON is a full channel row: find, search, match, and describe.
 type channelJSON struct {
-	Name         string         `json:"name"`
-	Group        string         `json:"group"`
-	File         string         `json:"file"`
-	IsTimestamp  bool           `json:"is_timestamp"`
-	Samples      int            `json:"samples"`
-	Timed        bool           `json:"timed"`
-	Source       string         `json:"source"`
-	Start        string         `json:"start,omitempty"`
-	Last         string         `json:"last,omitempty"`
-	Dt           float64        `json:"dt"`
-	Timestamp    string         `json:"timestamp,omitempty"`
-	DataType     string         `json:"data_type,omitempty"`
-	Unit         string         `json:"unit,omitempty"`
-	HasScale     bool           `json:"has_scale"`
-	Scale        *scaleOut      `json:"scale,omitempty"`
-	HasNonlinear bool           `json:"has_nonlinear_scale"`
-	DAQmx        bool           `json:"daqmx,omitempty"`
-	Digital      bool           `json:"digital,omitempty"`
-	DAQmxScale   bool           `json:"daqmx_scale,omitempty"`
-	Properties   map[string]any `json:"properties,omitempty"`
+	channelHead
+	File string `json:"file"`
+	channelCore
+	Properties map[string]any `json:"properties,omitempty"`
 }
 
 func (s *session) enrich(in []dataset.Occurrence) []channelJSON {
 	out := make([]channelJSON, len(in))
 	for i, o := range in {
-		c := channelJSON{
-			Name:        o.Name,
-			Group:       o.Group,
-			File:        o.File,
-			IsTimestamp: o.IsTimestamp,
-			Samples:     o.Samples,
-			Timed:       o.Timed,
-			Source:      o.Source.String(),
-			Dt:          o.Dt,
-			Timestamp:   o.Timestamp,
-		}
-		if o.Timed && o.Samples > 0 {
-			c.Start = o.Start.UTC().Format(time.RFC3339Nano)
-			c.Last = o.Last.UTC().Format(time.RFC3339Nano)
-		}
-		if info, ok := s.meta[chKey{file: o.File, group: o.Group, name: o.Name}]; ok {
-			c.DataType = info.dataType
-			c.Unit = info.unit
-			c.HasScale = info.hasLinear
-			c.HasNonlinear = info.nonlinear
+		core, info, ok := s.core(o)
+		c := channelJSON{channelHead: channelHead{Name: o.Name, Group: o.Group}, File: o.File, channelCore: core}
+		if ok {
 			c.Properties = info.properties
-			c.DAQmx = info.daqmx
-			c.Digital = info.digital
-			c.DAQmxScale = info.willScale
-			if info.hasLinear {
-				c.Scale = &scaleOut{Slope: info.slope, Intercept: info.intercept, Index: info.index}
-			}
 		}
 		out[i] = c
 	}
@@ -356,7 +346,9 @@ func (s *session) finishRead(sels []dataset.Selector, req map[string]json.RawMes
 	if err != nil {
 		return nil, nil, err
 	}
-	d.header["reads"] = reads
+	if err := s.compactRead(d, encs, reads); err != nil {
+		return nil, nil, err
+	}
 	d.header["limited"] = limited
 	return d, nil, nil
 }
@@ -549,7 +541,7 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 			series[i].Times, series[i].Clock = nil, nil
 		}
 		ser := series[i]
-		info, match, err := s.scaleFor(ser, scaled)
+		info, match, propsAt, err := s.scaleFor(ser, scaled)
 		if err != nil {
 			return nil, nil, limited, err
 		}
@@ -561,6 +553,7 @@ func (s *session) readTables(sels []dataset.Selector, req map[string]json.RawMes
 		if err != nil {
 			return nil, nil, limited, err
 		}
+		encs[i].propsAt = propsAt
 	}
 	return encs, reads, limited, nil
 }
@@ -692,73 +685,75 @@ func (s *session) occurrencesNamed(name string) []dataset.Occurrence {
 	return s.occByName[name]
 }
 
-func (s *session) scaleFor(ser dataset.Series, scaled bool) (scaleInfo, bool, error) {
+// scaleFor picks the scale and properties of ser from its first file that
+// has the channel and checks the other files against it. propsAt is that
+// occurrence's catalog index, or -1. Properties match when every file has
+// the same interned property ids, which is the same as equal JSON.
+func (s *session) scaleFor(ser dataset.Series, scaled bool) (info scaleInfo, propsMatch bool, propsAt int, err error) {
+	propsAt = -1
 	files := ser.Files
 	if len(files) == 0 {
 		hits, err := s.occurrences(dataset.Selector{Name: ser.Name, Group: ser.Group})
 		if err != nil {
-			return scaleInfo{}, false, err
+			return scaleInfo{}, false, -1, err
 		}
 		for _, h := range hits {
 			files = append(files, h.File)
 		}
 	}
-	var info scaleInfo
 	set := false
-	propsMatch := true
-	var first []byte
+	propsMatch = true
 	for _, f := range files {
-		m, ok := s.meta[chKey{file: f, group: ser.Group, name: ser.Name}]
+		key := chKey{file: f, group: ser.Group, name: ser.Name}
+		m, ok := s.meta[key]
 		if !ok {
 			continue
 		}
-		blob, err := json.Marshal(m.properties)
-		if err != nil {
-			return scaleInfo{}, false, err
-		}
-		if first == nil {
-			first = blob
+		if !set {
 			info = m
 			set = true
+			if at, ok := s.cat.occAt[key]; ok {
+				propsAt = at
+			}
 			continue
 		}
-		if !bytes.Equal(first, blob) {
+		if !slices.Equal(m.propIDs, info.propIDs) {
 			propsMatch = false
 		}
 		if m.hasLinear != info.hasLinear || m.slope != info.slope || m.intercept != info.intercept || m.nonlinear != info.nonlinear {
 			if scaled {
-				return scaleInfo{}, false, errCode("scale_mismatch", "linear scale differs across files of "+ser.Group+"/"+ser.Name)
+				return scaleInfo{}, false, -1, errCode("scale_mismatch", "linear scale differs across files of "+ser.Group+"/"+ser.Name)
 			}
 		}
 		if (m.daqmx || info.daqmx) && (m.daqmx != info.daqmx || m.daqmxKey != info.daqmxKey || m.willScale != info.willScale || m.digital != info.digital || m.tdmsType != info.tdmsType) {
 			if scaled {
-				return scaleInfo{}, false, errCode("scale_mismatch", "DAQmx scale differs across files of "+ser.Group+"/"+ser.Name)
+				return scaleInfo{}, false, -1, errCode("scale_mismatch", "DAQmx scale differs across files of "+ser.Group+"/"+ser.Name)
 			}
 		}
 	}
 	if !set {
-		return scaleInfo{}, true, nil
+		return scaleInfo{}, true, -1, nil
 	}
 	if info.daqmx {
 		if scaled {
 			if info.nonlinear {
-				return scaleInfo{}, false, errCode("nonlinear_scale", "channel "+ser.Group+"/"+ser.Name+" has a DAQmx scale this bridge does not apply")
+				return scaleInfo{}, false, -1, errCode("nonlinear_scale", "channel "+ser.Group+"/"+ser.Name+" has a DAQmx scale this bridge does not apply")
 			}
 			if !info.willScale {
-				return scaleInfo{}, false, errCode("no_scale", "channel "+ser.Group+"/"+ser.Name+" has no DAQmx scale")
+				return scaleInfo{}, false, -1, errCode("no_scale", "channel "+ser.Group+"/"+ser.Name+" has no DAQmx scale")
 			}
 		}
-		return info, propsMatch, nil
+		return info, propsMatch, propsAt, nil
 	}
 	if scaled {
 		if info.nonlinear && !info.hasLinear {
-			return scaleInfo{}, false, errCode("nonlinear_scale", "channel "+ser.Group+"/"+ser.Name+" has a non-linear scale; gotdms does not apply it")
+			return scaleInfo{}, false, -1, errCode("nonlinear_scale", "channel "+ser.Group+"/"+ser.Name+" has a non-linear scale; gotdms does not apply it")
 		}
 		if !info.hasLinear {
-			return scaleInfo{}, false, errCode("no_scale", "channel "+ser.Group+"/"+ser.Name+" has no NI linear scale")
+			return scaleInfo{}, false, -1, errCode("no_scale", "channel "+ser.Group+"/"+ser.Name+" has no NI linear scale")
 		}
 	}
-	return info, propsMatch, nil
+	return info, propsMatch, propsAt, nil
 }
 
 func windowOf(req map[string]json.RawMessage) (time.Time, time.Time, bool, error) {
@@ -826,9 +821,12 @@ func classify(err error) (string, string, []channelJSON) {
 		out := make([]channelJSON, len(amb.Candidates))
 		for i, o := range amb.Candidates {
 			out[i] = channelJSON{
-				Name: o.Name, Group: o.Group, File: o.File,
-				IsTimestamp: o.IsTimestamp, Samples: o.Samples, Timed: o.Timed,
-				Source: o.Source.String(), Dt: o.Dt, Timestamp: o.Timestamp,
+				channelHead: channelHead{Name: o.Name, Group: o.Group},
+				channelCore: channelCore{
+					IsTimestamp: o.IsTimestamp, Samples: o.Samples, Timed: o.Timed,
+					Source: o.Source.String(), Dt: o.Dt, Timestamp: o.Timestamp,
+				},
+				File: o.File,
 			}
 		}
 		return "ambiguous", amb.Error(), out

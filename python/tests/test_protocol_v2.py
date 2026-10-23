@@ -206,10 +206,11 @@ while True:
         frame({"op": "result", "closed": True})
         sys.exit(0)
     if op == "open":
-        frame({"op": "result", "channels": [], "files": [], "groups": [], "basis": "2024-01-01T00:00:00Z"})
+        frame({"op": "result", "channels": [], "files": [], "groups": [], "property_table": [],
+               "basis": "2024-01-01T00:00:00Z"})
         continue
     if op == "catalog":
-        frame({"op": "result", "channels": []})
+        frame({"op": "result", "channels": [], "files": [], "groups": [], "property_table": []})
         continue
     frame({"op": "result_begin", "channels": [], "clocks": [], "reads": [], "limited": False,
            "streams": [{"id": 0, "kind": "channel", "bytes": 64}, {"id": 1, "kind": "channel", "bytes": 64}]})

@@ -234,19 +234,20 @@ func describeFile(path string, spec parsedSource) (fileMeta, []groupMeta, []chan
 		for _, ch := range chans {
 			info := inspectChannel(ch)
 			c := channelJSON{
-				Name:         ch.Name(),
-				Group:        ch.GroupName(),
-				File:         path,
-				Samples:      ch.Len(),
-				DataType:     info.dataType,
-				Unit:         info.unit,
-				HasScale:     info.hasLinear,
-				HasNonlinear: info.nonlinear,
-				DAQmx:        info.daqmx,
-				Digital:      info.digital,
-				DAQmxScale:   info.willScale,
-				Properties:   info.properties,
-				Source:       dataset.TimeNone.String(),
+				channelHead: channelHead{Name: ch.Name(), Group: ch.GroupName()},
+				channelCore: channelCore{
+					Samples:      ch.Len(),
+					DataType:     info.dataType,
+					Unit:         info.unit,
+					HasScale:     info.hasLinear,
+					HasNonlinear: info.nonlinear,
+					DAQmx:        info.daqmx,
+					Digital:      info.digital,
+					DAQmxScale:   info.willScale,
+					Source:       dataset.TimeNone.String(),
+				},
+				File:       path,
+				Properties: info.properties,
 			}
 			if info.hasLinear {
 				c.Scale = &scaleOut{Slope: info.slope, Intercept: info.intercept, Index: info.index}
