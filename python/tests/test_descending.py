@@ -112,6 +112,61 @@ class DescendingTest(unittest.TestCase):
             with self.assertRaises(gotdms.ArgumentError):
                 s.read("v", offset=1, limit=3)
 
+    def _files(self, files):
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        for k, (start_s, inc, n) in enumerate(files):
+            gotdms.write_tdms(
+                os.path.join(d, f"f{k}.tdms"),
+                pl.DataFrame({"v": np.arange(n, dtype=np.float64) + 100 * k}),
+                waveforms={"data": {"v": {"wf_start_time": T0 + timedelta(seconds=start_s), "wf_increment": inc}}},
+            )
+        return d
+
+    def test_range_reads_match_full_read(self):
+        # Every offset/limit window, including ones that cross a file
+        # boundary, an overlap, or a gap, is the same slice of the full
+        # (dataset) read: values, times, dt, and gaps for a whole window.
+        layouts = {
+            "contiguous": [(0, -1.0, 4), (-4, -1.0, 4)],
+            "gap": [(0, -1.0, 4), (-10, -1.0, 4)],
+            "overlap": [(0, -1.0, 4), (-2, -1.0, 4)],
+            "inside": [(0, -1.0, 6), (-1, -1.0, 2)],
+            "chain": [(0, -1.0, 4), (-2, -1.0, 4), (-4, -1.0, 4)],
+            "equal_start": [(0, -1.0, 4), (0, -1.0, 3)],
+            "half_step": [(0, -1.0, 4), (-3.5, -1.0, 4)],
+            "written_out_of_order": [(-10, -1.0, 4), (0, -1.0, 4)],
+            "fine_step": [(0, -0.25, 8), (-2, -0.25, 8)],
+            "ascending_overlap": [(0, 1.0, 4), (2, 1.0, 4)],
+        }
+        for name, files in layouts.items():
+            d = self._files(files)
+            for policy in ("keep_first", "keep_last"):
+                with gotdms.open(directory=d, overlap=policy) as s:
+                    full = s.read("v")
+                    n = len(full.y)
+                    ys, ts = full.y.tolist(), full.time_ns.tolist()
+                    for off in range(n + 2):
+                        for lim in [*range(n + 2), None]:
+                            with self.subTest(layout=name, overlap=policy, offset=off, limit=lim):
+                                part = s.read("v", offset=off) if lim is None else s.read("v", offset=off, limit=lim)
+                                hi = None if lim is None else off + lim
+                                self.assertEqual(part.y.tolist(), ys[off:hi])
+                                self.assertEqual(part.time_ns.tolist(), ts[off:hi])
+                                if len(ys[off:hi]) > 1:
+                                    self.assertEqual(part.meta["dt"], full.meta["dt"])
+                                if off == 0 and (lim is None or lim >= n):
+                                    self.assertEqual(part.meta.get("gaps") or [], full.meta.get("gaps") or [])
+
+    def test_keep_last_limit_zero(self):
+        # limit=0 keeps nothing. keep_last used to index the last kept
+        # sample of an empty window, and the bridge exited.
+        for inc in (-1.0, 1.0):
+            d = self._files([(0, inc, 4), (2 * inc, inc, 4)])
+            with gotdms.open(directory=d, overlap="keep_last") as s:
+                self.assertEqual(s.read("v", offset=0, limit=0).y.tolist(), [])
+                self.assertEqual(s.read("v", offset=3, limit=0).y.tolist(), [])
+                self.assertEqual(len(s.read("v").y), 6)
+
 
 if __name__ == "__main__":
     unittest.main()

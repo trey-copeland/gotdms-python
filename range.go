@@ -121,7 +121,9 @@ func (s *session) seriesRange(sel dataset.Selector, hits []dataset.Occurrence, o
 	}
 	var state []sampleRef
 	for _, o := range ordered {
-		if len(state) >= need && s.overlap != dataset.OverlapKeepLast {
+		// need is 0 for limit=0: nothing is kept, so keep_last has no last
+		// sample to compare the next file with.
+		if len(state) >= need && (s.overlap != dataset.OverlapKeepLast || len(state) == 0) {
 			break
 		}
 		if len(state) >= need && s.overlap == dataset.OverlapKeepLast {
