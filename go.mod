@@ -2,15 +2,17 @@ module github.com/trey-copeland/gotdms-python
 
 go 1.22.0
 
-// github.com/trey-copeland/gotdms v0.2.0 is commit
-// 290bb791b00ad56edeee814960062107d0600cc8. It is the first core tag with
+// github.com/trey-copeland/gotdms v0.3.0 is commit
+// d6481084e2e0a7be1acad332a4f2931b814b1dcb. It reports a negative Dt for
+// descending waveforms, which the bridge's range reads match. v0.2.0
+// (290bb791b00ad56edeee814960062107d0600cc8) was the first core tag with
 // dataset.WithSharedClock and dataset.WithoutTimes, which protocol 2
 // reads with. v0.1.2 (8d2f134a160600c8a12b2076cc395c6b05c5c9e2) added the
 // metadata-padding skip. This module does not build segment-index
 // sidecars. See EXTRACTION.md.
 require (
 	github.com/apache/arrow-go/v18 v18.0.0
-	github.com/trey-copeland/gotdms v0.2.0
+	github.com/trey-copeland/gotdms v0.3.0
 )
 
 require (

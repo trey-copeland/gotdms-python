@@ -85,6 +85,6 @@ Python 3.10 or newer. The client and the bridge speak protocol version 2. That p
 
 This repository is [gotdms-python](https://github.com/trey-copeland/gotdms-python). The proposed PyPI distribution name is `gotdms`. The import package is `gotdms`. Nothing has been published to PyPI, and this repository has no release tag. `0.1.0` in `pyproject.toml` is the version recorded for that first release. It is not a tag.
 
-The Go module requires [gotdms](https://github.com/trey-copeland/gotdms) `v0.2.0` (`290bb791b00ad56edeee814960062107d0600cc8`). That is the first core tag with `dataset.WithSharedClock` and `dataset.WithoutTimes`, which protocol 2 reads with. There is no `replace` directive. See [`EXTRACTION.md`](EXTRACTION.md).
+The Go module requires [gotdms](https://github.com/trey-copeland/gotdms) `v0.3.0` (`d6481084e2e0a7be1acad332a4f2931b814b1dcb`). `v0.2.0` (`290bb791b00ad56edeee814960062107d0600cc8`) was the first core tag with `dataset.WithSharedClock` and `dataset.WithoutTimes`, which protocol 2 reads with; `v0.3.0` reports a negative `dt` for descending waveforms. There is no `replace` directive. See [`EXTRACTION.md`](EXTRACTION.md).
 
 Contributing: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
