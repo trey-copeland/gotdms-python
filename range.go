@@ -267,15 +267,33 @@ func (s *session) orderTimed(hits []dataset.Occurrence, cache *fileCache) ([]dat
 		z time.Time
 	}
 	keys := make([]keyed, len(hits))
+	pos, neg := false, false
 	for i, o := range hits {
 		z, err := s.sampleZero(o, cache)
 		if err != nil {
 			return nil, err
 		}
 		keys[i] = keyed{o: o, z: z}
+		if o.Source == dataset.TimeWaveform && o.Samples > 0 {
+			switch inc := s.pieceDt(o, nil, cache); {
+			case inc > 0:
+				pos = true
+			case inc < 0:
+				neg = true
+			}
+		}
+	}
+	// gotdms v0.3.0 dataset reads order a descending (negative
+	// wf_increment) waveform latest start first and refuse files of one
+	// channel whose increments disagree in sign. Range reads do the same.
+	if pos && neg {
+		return nil, fmt.Errorf("%w: %q group %q mixes positive and negative increments across files", dataset.ErrArgument, hits[0].Name, hits[0].Group)
 	}
 	sortSlice(keys, func(a, b keyed) bool {
 		if !a.z.Equal(b.z) {
+			if neg {
+				return a.z.After(b.z)
+			}
 			return a.z.Before(b.z)
 		}
 		return a.o.File < b.o.File
@@ -541,7 +559,7 @@ func appendFile(state []sampleRef, file string, times []time.Time, dt float64, p
 				case dataset.OverlapKeepFirst:
 					continue
 				case dataset.OverlapKeepLast:
-					for len(state) > 0 && !state[len(state)-1].t.Before(t) {
+					for len(state) > 0 && keptAtOrPast(state[len(state)-1], t) {
 						state = state[:len(state)-1]
 					}
 				default:
@@ -552,6 +570,16 @@ func appendFile(state []sampleRef, file string, times []time.Time, dt float64, p
 		state = append(state, sampleRef{file: file, index: i, t: t, dt: dt})
 	}
 	return state, nil
+}
+
+// keptAtOrPast reports whether kept sample k is at or past incoming time t
+// along k's axis: at or after t when ascending, at or before t when
+// descending (negative dt), the samples OverlapKeepLast drops.
+func keptAtOrPast(k sampleRef, t time.Time) bool {
+	if k.dt < 0 {
+		return !k.t.After(t)
+	}
+	return !k.t.Before(t)
 }
 
 func gapsOf(samples []sampleRef) []dataset.Gap {
@@ -731,7 +759,9 @@ func uniformSampleDts(dts []float64) (float64, bool) {
 	}
 	dt := dts[0]
 	for _, d := range dts[1:] {
-		if d <= 0 || math.Abs(d-dt) > 1e-9*math.Max(1, math.Abs(dt)) {
+		// A descending waveform (negative wf_increment) has a uniform
+		// negative step, which gotdms v0.3.0 dataset reads report as Dt.
+		if d == 0 || (d < 0) != (dt < 0) || math.Abs(d-dt) > 1e-9*math.Max(1, math.Abs(dt)) {
 			return 0, false
 		}
 	}
@@ -749,7 +779,12 @@ func overlapsTime(t, last time.Time, dt float64) bool {
 }
 
 func gapBetweenTime(t, last time.Time, dt float64) bool {
-	if dt <= 0 {
+	if dt < 0 {
+		// Descending axis: a gap is a jump further back than one step, as
+		// gotdms v0.3.0 records it (From after To).
+		return t.Before(addDt(last, dt).Add(-time.Nanosecond))
+	}
+	if dt == 0 {
 		return false
 	}
 	return t.After(addDt(last, dt).Add(time.Nanosecond))
